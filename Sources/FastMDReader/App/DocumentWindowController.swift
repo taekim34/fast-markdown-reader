@@ -28,12 +28,31 @@ final class DocumentWindowController: NSWindowController {
         scrollView.hasVerticalScroller = true
         scrollView.drawsBackground = true
         window.contentView = scrollView
+
+        // C6: text reflow on window resize restrands copy buttons at stale positions.
+        // Observe frame changes and re-place them (debounced).
+        textView.postsFrameChangedNotifications = true
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(viewportChanged),
+            name: NSView.frameDidChangeNotification, object: textView)
+        // Re-place buttons on scroll so only visible code blocks carry one (perf: we never
+        // force layout of off-screen blocks just to position an overlay).
+        scrollView.contentView.postsBoundsChangedNotifications = true
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(viewportChanged),
+            name: NSView.boundsDidChangeNotification, object: scrollView.contentView)
     }
+
+    deinit { NotificationCenter.default.removeObserver(self) }
 
     override init(window: NSWindow?) {
         let storage = NSTextStorage()
         let layout = NSLayoutManager()
         storage.addLayoutManager(layout)
+        // Non-contiguous layout: TextKit 1 lays out only what's needed (≈ the viewport)
+        // instead of the whole document up front — the key lever for opening and scrolling
+        // long documents fast with low memory.
+        layout.allowsNonContiguousLayout = true
         let container = NSTextContainer(size: NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude))
         container.widthTracksTextView = true
         layout.addTextContainer(container)
@@ -45,5 +64,56 @@ final class DocumentWindowController: NSWindowController {
 
     func display(_ attributed: NSAttributedString) {
         textView.textStorage?.setAttributedString(attributed)
+        // Place buttons after layout has a chance to run.
+        DispatchQueue.main.async { [weak self] in self?.placeCopyButtons() }
+    }
+
+    // MARK: - Copy-button overlay
+
+    private var copyButtons: [NSButton] = []
+    private var pendingPlace: DispatchWorkItem?
+
+    @objc private func viewportChanged() {
+        pendingPlace?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.placeCopyButtons() }
+        pendingPlace = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: work)
+    }
+
+    func placeCopyButtons() {
+        copyButtons.forEach { $0.removeFromSuperview() }
+        copyButtons.removeAll()
+        guard let storage = textView.textStorage,
+              let lm = textView.layoutManager,
+              let container = textView.textContainer, storage.length > 0 else { return }
+        // Visible character range only — enumerating attributes is cheap (no layout), but
+        // boundingRect forces glyph layout, so we compute it solely for on-screen blocks.
+        let visibleRect = textView.visibleRect
+        let visibleGlyphs = lm.glyphRange(forBoundingRect: visibleRect, in: container)
+        let visibleChars = lm.characterRange(forGlyphRange: visibleGlyphs, actualGlyphRange: nil)
+        guard visibleChars.length > 0 else { return }
+        storage.enumerateAttribute(MDAttr.codeBlock, in: visibleChars) { value, range, _ in
+            guard let code = value as? String else { return }
+            let glyphRange = lm.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+            var rect = lm.boundingRect(forGlyphRange: glyphRange, in: container)
+            rect.origin.x += textView.textContainerInset.width
+            rect.origin.y += textView.textContainerInset.height
+            let btn = NSButton(title: "Copy", target: self, action: #selector(copyCode(_:)))
+            btn.bezelStyle = .inline
+            btn.font = .systemFont(ofSize: 10)
+            btn.sizeToFit()
+            btn.setFrameOrigin(NSPoint(x: rect.maxX - btn.frame.width - 8, y: rect.minY + 4))
+            btn.identifier = NSUserInterfaceItemIdentifier(code)
+            textView.addSubview(btn)
+            copyButtons.append(btn)
+        }
+    }
+
+    @objc private func copyCode(_ sender: NSButton) {
+        guard let code = sender.identifier?.rawValue else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(code, forType: .string)
+        sender.title = "Copied"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { sender.title = "Copy" }
     }
 }

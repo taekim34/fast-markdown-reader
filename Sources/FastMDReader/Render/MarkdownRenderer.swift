@@ -116,13 +116,18 @@ private struct AttributedBuilder: MarkupWalker {
     }
 
     mutating func visitCodeBlock(_ codeBlock: CodeBlock) {
-        // Full styling/highlighting/copy button added in Task 4; mermaid in Task 5.
-        // Baseline: monospace block.
+        // mermaid handled in Task 5; here treat everything else as a highlighted block.
+        if (codeBlock.language ?? "").lowercased() == "mermaid" { return } // placeholder filled in Task 5
         let ps = NSMutableParagraphStyle()
-        ps.headIndent = 12; ps.firstLineHeadIndent = 12
-        result.append(NSAttributedString(string: codeBlock.code, attributes: [
-            .font: theme.codeFont, .foregroundColor: theme.textColor,
-            .backgroundColor: theme.codeBackground, .paragraphStyle: ps]))
+        ps.headIndent = 12; ps.firstLineHeadIndent = 12; ps.paragraphSpacingBefore = 6; ps.paragraphSpacing = 6
+        let highlighted = NSMutableAttributedString(attributedString:
+            CodeHighlighter.highlight(codeBlock.code, language: codeBlock.language, theme: theme))
+        highlighted.addAttributes([.backgroundColor: theme.codeBackground, .paragraphStyle: ps],
+                                  range: NSRange(location: 0, length: highlighted.length))
+        // Tag the block so the copy-button overlay can find it (C5: MDAttr, not a literal).
+        highlighted.addAttribute(MDAttr.codeBlock, value: codeBlock.code,
+                                 range: NSRange(location: 0, length: highlighted.length))
+        result.append(highlighted)
         newline(2)
     }
 
