@@ -4,7 +4,7 @@ final class MarkdownDocument: NSDocument {
     private(set) var text: String = ""
 
     override class var autosavesInPlace: Bool { false }
-    override func canAsynchronouslyWrite(to url: URL, ofType typeName: String, for saveOperation: NSDocument.SaveOperation) -> Bool { false }
+    override func canAsynchronouslyWrite(to url: URL, ofType typeName: String, for saveOperation: NSDocument.SaveOperationType) -> Bool { false }
 
     override func read(from data: Data, ofType typeName: String) throws {
         self.text = String(decoding: data, as: UTF8.self)
@@ -17,12 +17,9 @@ final class MarkdownDocument: NSDocument {
         render(into: wc)
     }
 
-    // Replaced in M3 by the markdown renderer. For now, show raw text.
     private func render(into wc: DocumentWindowController) {
-        let attr = NSAttributedString(
-            string: text,
-            attributes: [.font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular),
-                         .foregroundColor: NSColor.textColor])
+        // FontSizeStore is the SINGLE owner of font size — never read UserDefaults directly.
+        let attr = MarkdownRenderer.render(text, theme: .current(size: FontSizeStore.size))
         wc.display(attr)
         wc.window?.title = displayName ?? "fast-md-reader"
     }

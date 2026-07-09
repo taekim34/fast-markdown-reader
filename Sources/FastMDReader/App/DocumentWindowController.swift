@@ -34,7 +34,7 @@ final class DocumentWindowController: NSWindowController {
         let storage = NSTextStorage()
         let layout = NSLayoutManager()
         storage.addLayoutManager(layout)
-        let container = NSTextContainer(size: NSSize(width: 0, height: .greatestFiniteMagnitude))
+        let container = NSTextContainer(size: NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude))
         container.widthTracksTextView = true
         layout.addTextContainer(container)
         textView = NSTextView(frame: .zero, textContainer: container)
