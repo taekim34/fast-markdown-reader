@@ -19,6 +19,8 @@ final class DocumentWindowController: NSWindowController {
         textView.isEditable = false
         textView.isSelectable = true          // mouse selection allowed
         textView.isRichText = true
+        textView.usesFindBar = true           // ⌘F find bar (free for NSTextView)
+        textView.isIncrementalSearchingEnabled = true
         textView.textContainerInset = NSSize(width: 24, height: 20)
         textView.autoresizingMask = [.width]
         textView.isVerticallyResizable = true

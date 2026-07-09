@@ -21,6 +21,18 @@ final class MarkdownDocument: NSDocument {
         render(into: wc)
     }
 
+    // MARK: - Font size (menu actions routed through the responder chain)
+
+    @objc func increaseReaderFontSize(_ sender: Any?) { FontSizeStore.increase(); reRenderPreservingCaret() }
+    @objc func decreaseReaderFontSize(_ sender: Any?) { FontSizeStore.decrease(); reRenderPreservingCaret() }
+
+    private func reRenderPreservingCaret() {
+        guard let wc = windowControllers.first as? DocumentWindowController else { return }
+        let saved = wc.textView.readingCaret
+        render(into: wc)                    // resets caret to 0 and re-lays out at the new size
+        wc.textView.readingCaret = saved    // restore reading position (clamped internally)
+    }
+
     private func render(into wc: DocumentWindowController) {
         // FontSizeStore is the SINGLE owner of font size — never read UserDefaults directly.
         let attr = MarkdownRenderer.render(text, theme: .current(size: FontSizeStore.size))

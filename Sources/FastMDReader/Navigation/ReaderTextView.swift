@@ -84,4 +84,11 @@ final class ReaderTextView: NSTextView {
 
     /// Reset the caret to the top when a fresh document is displayed.
     func resetCaret() { caret = 0; lastLineRange = nil }
+
+    /// Reading caret (UTF-16 offset). Setting it clamps into range and re-highlights —
+    /// used to preserve the reading position across a font-size re-render.
+    var readingCaret: Int {
+        get { caret }
+        set { caret = max(0, min(newValue, length)) }
+    }
 }
