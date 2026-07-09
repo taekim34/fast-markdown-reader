@@ -168,14 +168,19 @@ private struct AttributedBuilder: MarkupWalker {
         ps.paragraphSpacingBefore = CodeCardMetrics.verticalPadding + 6
         ps.paragraphSpacing = CodeCardMetrics.verticalPadding + 6
         ps.lineSpacing = 2
-        ps.lineBreakMode = .byCharWrapping   // fold long code lines instead of scrolling sideways
-        let highlighted = NSMutableAttributedString(attributedString:
-            CodeHighlighter.highlight(codeBlock.code, language: codeBlock.language, theme: theme))
-        highlighted.addAttributes([.paragraphStyle: ps],
-                                  range: NSRange(location: 0, length: highlighted.length))
-        // Tag the block so the copy-button overlay can find it (C5: MDAttr, not a literal).
-        highlighted.addAttribute(MDAttr.codeBlock, value: codeBlock.code,
-                                 range: NSRange(location: 0, length: highlighted.length))
+        ps.firstLineHeadIndent = CodeCardMetrics.textInset
+        ps.lineBreakMode = .byCharWrapping   // default: fold long lines (toggle to no-wrap per block)
+        // A blank header line at the top of the card reserves room for the Copy / Wrap
+        // buttons so they never overlap the code.
+        let highlighted = NSMutableAttributedString(string: "\u{200B}\n",
+            attributes: [.font: theme.codeFont, .foregroundColor: theme.textColor])
+        highlighted.append(CodeHighlighter.highlight(codeBlock.code, language: codeBlock.language, theme: theme))
+        let full = NSRange(location: 0, length: highlighted.length)
+        highlighted.addAttributes([.paragraphStyle: ps], range: full)
+        // Tag the block (C5: MDAttr, not a literal) with the code + its language so the
+        // copy overlay and the no-wrap toggle can rebuild it.
+        highlighted.addAttribute(MDAttr.codeBlock, value: codeBlock.code, range: full)
+        highlighted.addAttribute(MDAttr.codeLang, value: codeBlock.language ?? "", range: full)
         result.append(highlighted)
         newline(2)
     }

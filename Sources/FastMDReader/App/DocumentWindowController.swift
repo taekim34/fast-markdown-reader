@@ -120,11 +120,11 @@ final class DocumentWindowController: NSWindowController {
         placeCopyButtons()
     }
 
-    // MARK: - Copy-button overlay
+    // MARK: - Code-block overlays (Copy + Wrap toggle + optional no-wrap scroll view)
 
-    private var copyButtons: [NSButton] = []
+    private var codeOverlays: [NSView] = []
+    private var noWrapCodes: Set<String> = []   // code blocks toggled to no-wrap (per session)
     private var pendingPlace: DispatchWorkItem?
-
     private var lastClipWidth: CGFloat = 0
 
     @objc private func viewportChanged() {
@@ -138,37 +138,90 @@ final class DocumentWindowController: NSWindowController {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: work)
     }
 
+    /// Place the Copy + Wrap buttons (and, for no-wrap blocks, a horizontally-scrollable code
+    /// overlay) for every code block currently on screen. Rebuilt on scroll/resize so only
+    /// visible blocks cost anything; the no-wrap overlay exists only for toggled blocks, so a
+    /// normal document loads with zero extra views.
     func placeCopyButtons() {
-        copyButtons.forEach { $0.removeFromSuperview() }
-        copyButtons.removeAll()
+        codeOverlays.forEach { $0.removeFromSuperview() }
+        codeOverlays.removeAll()
         guard let storage = textView.textStorage,
               let lm = textView.layoutManager,
               let container = textView.textContainer, storage.length > 0 else { return }
-        // Visible character range only — enumerating attributes is cheap (no layout), but
-        // boundingRect forces glyph layout, so we compute it solely for on-screen blocks.
         let visibleRect = textView.visibleRect
         let visibleGlyphs = lm.glyphRange(forBoundingRect: visibleRect, in: container)
         let visibleChars = lm.characterRange(forGlyphRange: visibleGlyphs, actualGlyphRange: nil)
         guard visibleChars.length > 0 else { return }
+        let inset = textView.textContainerInset
+        let cardRight = inset.width + container.size.width - CodeCardMetrics.horizontalMargin
+        let cardLeft = inset.width + CodeCardMetrics.horizontalMargin
+
         storage.enumerateAttribute(MDAttr.codeBlock, in: visibleChars) { value, range, _ in
             guard let code = value as? String else { return }
+            let lang = (storage.attribute(MDAttr.codeLang, at: range.location, effectiveRange: nil) as? String) ?? ""
             let glyphRange = lm.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
             var rect = lm.boundingRect(forGlyphRange: glyphRange, in: container)
-            rect.origin.x += textView.textContainerInset.width
-            rect.origin.y += textView.textContainerInset.height
-            let btn = NSButton(title: "Copy", target: self, action: #selector(copyCode(_:)))
-            btn.bezelStyle = .inline
-            btn.font = .systemFont(ofSize: 10)
-            btn.sizeToFit()
-            // Top-right of the card (card right edge = inset + container width - margin),
-            // independent of the code line length.
-            let cardRight = textView.textContainerInset.width + container.size.width - CodeCardMetrics.horizontalMargin
-            btn.setFrameOrigin(NSPoint(x: cardRight - btn.frame.width - 6,
-                                       y: rect.minY - CodeCardMetrics.verticalPadding + 3))
-            btn.identifier = NSUserInterfaceItemIdentifier(code)
-            textView.addSubview(btn)
-            copyButtons.append(btn)
+            rect.origin.x += inset.width; rect.origin.y += inset.height
+            let headerY = rect.minY + 2   // the blank header line reserved by the renderer
+
+            // No-wrap overlay covers the code area (below the header line) with its own scroller.
+            if self.noWrapCodes.contains(code), range.length > 2 {
+                let codeChars = NSRange(location: range.location + 2, length: range.length - 2)
+                let codeGlyphs = lm.glyphRange(forCharacterRange: codeChars, actualCharacterRange: nil)
+                var codeRect = lm.boundingRect(forGlyphRange: codeGlyphs, in: container)
+                codeRect.origin.x += inset.width; codeRect.origin.y += inset.height
+                let frame = NSRect(x: cardLeft, y: codeRect.minY,
+                                   width: cardRight - cardLeft, height: codeRect.height)
+                let sv = self.makeNoWrapCodeView(code: code, lang: lang, frame: frame)
+                self.textView.addSubview(sv)
+                self.codeOverlays.append(sv)
+            }
+
+            let copy = self.makeButton("Copy", action: #selector(self.copyCode(_:)), code: code)
+            let wrapTitle = self.noWrapCodes.contains(code) ? "Wrap" : "No-wrap"
+            let wrap = self.makeButton(wrapTitle, action: #selector(self.toggleWrap(_:)), code: code)
+            copy.setFrameOrigin(NSPoint(x: cardRight - copy.frame.width - 6, y: headerY))
+            wrap.setFrameOrigin(NSPoint(x: copy.frame.minX - wrap.frame.width - 6, y: headerY))
+            self.textView.addSubview(copy)   // buttons on top of any overlay
+            self.textView.addSubview(wrap)
+            self.codeOverlays.append(copy); self.codeOverlays.append(wrap)
         }
+    }
+
+    private func makeButton(_ title: String, action: Selector, code: String) -> NSButton {
+        let b = NSButton(title: title, target: self, action: action)
+        b.bezelStyle = .inline
+        b.font = .systemFont(ofSize: 10)
+        b.sizeToFit()
+        b.identifier = NSUserInterfaceItemIdentifier(code)
+        return b
+    }
+
+    private func makeNoWrapCodeView(code: String, lang: String, frame: NSRect) -> NSScrollView {
+        let sv = NSScrollView(frame: frame)
+        sv.hasHorizontalScroller = true
+        sv.hasVerticalScroller = false
+        sv.autohidesScrollers = true
+        sv.drawsBackground = true
+        sv.backgroundColor = .textBackgroundColor   // opaque, hides the folded code underneath
+        sv.wantsLayer = true
+        sv.layer?.cornerRadius = CodeCardMetrics.cornerRadius
+        sv.layer?.borderWidth = 1
+        sv.layer?.borderColor = NSColor.textColor.withAlphaComponent(0.11).cgColor
+        let tv = NSTextView(frame: NSRect(origin: .zero, size: frame.size))
+        tv.isEditable = false; tv.isSelectable = true
+        tv.drawsBackground = false
+        tv.textContainerInset = NSSize(width: CodeCardMetrics.textInset, height: 4)
+        tv.isHorizontallyResizable = true
+        tv.isVerticallyResizable = true
+        tv.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        tv.textContainer?.widthTracksTextView = false
+        tv.textContainer?.containerSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        let hl = CodeHighlighter.highlight(code, language: lang.isEmpty ? nil : lang,
+                                           theme: .current(size: FontSizeStore.size))
+        tv.textStorage?.setAttributedString(hl)
+        sv.documentView = tv
+        return sv
     }
 
     @objc private func copyCode(_ sender: NSButton) {
@@ -177,5 +230,11 @@ final class DocumentWindowController: NSWindowController {
         NSPasteboard.general.setString(code, forType: .string)
         sender.title = "Copied"
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { sender.title = "Copy" }
+    }
+
+    @objc private func toggleWrap(_ sender: NSButton) {
+        guard let code = sender.identifier?.rawValue else { return }
+        if noWrapCodes.contains(code) { noWrapCodes.remove(code) } else { noWrapCodes.insert(code) }
+        placeCopyButtons()
     }
 }
