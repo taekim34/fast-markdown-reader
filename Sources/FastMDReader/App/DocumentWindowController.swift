@@ -47,7 +47,7 @@ final class DocumentWindowController: NSWindowController {
 
     override init(window: NSWindow?) {
         let storage = NSTextStorage()
-        let layout = NSLayoutManager()
+        let layout = CodeCardLayoutManager()   // draws code blocks as rounded cards
         storage.addLayoutManager(layout)
         // Non-contiguous layout: TextKit 1 lays out only what's needed (≈ the viewport)
         // instead of the whole document up front — the key lever for opening and scrolling
@@ -102,7 +102,11 @@ final class DocumentWindowController: NSWindowController {
             btn.bezelStyle = .inline
             btn.font = .systemFont(ofSize: 10)
             btn.sizeToFit()
-            btn.setFrameOrigin(NSPoint(x: rect.maxX - btn.frame.width - 8, y: rect.minY + 4))
+            // Top-right of the card (card right edge = inset + container width - margin),
+            // independent of the code line length.
+            let cardRight = textView.textContainerInset.width + container.size.width - CodeCardMetrics.horizontalMargin
+            btn.setFrameOrigin(NSPoint(x: cardRight - btn.frame.width - 6,
+                                       y: rect.minY - CodeCardMetrics.verticalPadding + 3))
             btn.identifier = NSUserInterfaceItemIdentifier(code)
             textView.addSubview(btn)
             copyButtons.append(btn)

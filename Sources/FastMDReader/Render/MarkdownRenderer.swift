@@ -118,11 +118,18 @@ private struct AttributedBuilder: MarkupWalker {
     mutating func visitCodeBlock(_ codeBlock: CodeBlock) {
         // mermaid handled in Task 5; here treat everything else as a highlighted block.
         if (codeBlock.language ?? "").lowercased() == "mermaid" { return } // placeholder filled in Task 5
+        // Card look: padding inside (head/tail indent) and gaps outside (paragraph spacing).
+        // No flat .backgroundColor — CodeCardLayoutManager draws the rounded card backdrop.
         let ps = NSMutableParagraphStyle()
-        ps.headIndent = 12; ps.firstLineHeadIndent = 12; ps.paragraphSpacingBefore = 6; ps.paragraphSpacing = 6
+        ps.headIndent = CodeCardMetrics.textInset
+        ps.firstLineHeadIndent = CodeCardMetrics.textInset
+        ps.tailIndent = -CodeCardMetrics.textInset
+        ps.paragraphSpacingBefore = CodeCardMetrics.verticalPadding + 6
+        ps.paragraphSpacing = CodeCardMetrics.verticalPadding + 6
+        ps.lineSpacing = 2
         let highlighted = NSMutableAttributedString(attributedString:
             CodeHighlighter.highlight(codeBlock.code, language: codeBlock.language, theme: theme))
-        highlighted.addAttributes([.backgroundColor: theme.codeBackground, .paragraphStyle: ps],
+        highlighted.addAttributes([.paragraphStyle: ps],
                                   range: NSRange(location: 0, length: highlighted.length))
         // Tag the block so the copy-button overlay can find it (C5: MDAttr, not a literal).
         highlighted.addAttribute(MDAttr.codeBlock, value: codeBlock.code,
