@@ -41,13 +41,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let fileItem = NSMenuItem(); mainMenu.addItem(fileItem)
         let fileMenu = NSMenu(title: "File"); fileItem.submenu = fileMenu
         fileMenu.addItem(withTitle: "Open…", action: #selector(NSDocumentController.openDocument(_:)), keyEquivalent: "o")
-        // Open Recent — AppKit auto-populates any submenu that contains a "Clear Menu" item
-        // wired to clearRecentDocuments:. NSDocumentController records opened docs automatically.
+        // Open Recent — AppKit's automatic population does NOT attach to a code-built menu (no
+        // MainMenu.nib), so it stayed empty. Populate it ourselves from recentDocumentURLs via a
+        // menu delegate that rebuilds on every open (menuNeedsUpdate).
         let recentItem = fileMenu.addItem(withTitle: "Open Recent", action: nil, keyEquivalent: "")
         let recentMenu = NSMenu(title: "Open Recent")
+        recentMenu.delegate = self
         recentItem.submenu = recentMenu
-        recentMenu.addItem(.separator())
-        recentMenu.addItem(withTitle: "Clear Menu", action: #selector(NSDocumentController.clearRecentDocuments(_:)), keyEquivalent: "")
         let close = fileMenu.addItem(withTitle: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
         close.keyEquivalentModifierMask = [.command]
         fileMenu.addItem(.separator())
@@ -85,5 +85,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.helpMenu = helpMenu
 
         NSApp.mainMenu = mainMenu
+    }
+
+    // MARK: - Open Recent (manual population)
+
+    @objc private func openRecentDocument(_ sender: NSMenuItem) {
+        guard let url = sender.representedObject as? URL else { return }
+        NSDocumentController.shared.openDocument(withContentsOf: url, display: true) { _, _, _ in }
+    }
+}
+
+extension AppDelegate: NSMenuDelegate {
+    // Rebuild the Open Recent submenu each time it opens: recent files first, then Clear Menu.
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+        let urls = NSDocumentController.shared.recentDocumentURLs
+        for url in urls {
+            let item = NSMenuItem(title: url.lastPathComponent, action: #selector(openRecentDocument(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = url
+            item.toolTip = url.path
+            menu.addItem(item)
+        }
+        if urls.isEmpty {
+            let empty = NSMenuItem(title: "No Recent Files", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            menu.addItem(empty)
+        }
+        menu.addItem(.separator())
+        menu.addItem(withTitle: "Clear Menu", action: #selector(NSDocumentController.clearRecentDocuments(_:)), keyEquivalent: "")
     }
 }
