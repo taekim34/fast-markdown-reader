@@ -47,6 +47,18 @@ final class ZoomScrollView: NSScrollView {
     override func mouseUp(with event: NSEvent) { NSCursor.openHand.set() }
 }
 
+/// Centers the document view when it is smaller than the viewport (a wide/short diagram would
+/// otherwise sit in the bottom-left corner instead of the middle).
+final class CenteringClipView: NSClipView {
+    override func constrainBoundsRect(_ proposedBounds: NSRect) -> NSRect {
+        var rect = super.constrainBoundsRect(proposedBounds)
+        guard let doc = documentView else { return rect }
+        if doc.frame.width < rect.width { rect.origin.x = (doc.frame.width - rect.width) / 2 }
+        if doc.frame.height < rect.height { rect.origin.y = (doc.frame.height - rect.height) / 2 }
+        return rect
+    }
+}
+
 /// A standalone, zoomable window for viewing a rendered diagram (mermaid) enlarged. The image is
 /// PDF-backed (vector), so NSScrollView magnification stays crisp at any zoom level.
 final class DiagramZoomWindowController: NSWindowController, NSWindowDelegate {
@@ -73,6 +85,7 @@ final class DiagramZoomWindowController: NSWindowController, NSWindowDelegate {
 
         scroll.frame = win.contentLayoutRect
         scroll.autoresizingMask = [.width, .height]
+        scroll.contentView = CenteringClipView()    // center small diagrams instead of bottom-left
         scroll.hasVerticalScroller = true
         scroll.hasHorizontalScroller = true
         scroll.allowsMagnification = true
@@ -82,7 +95,7 @@ final class DiagramZoomWindowController: NSWindowController, NSWindowDelegate {
 
         let iv = NSImageView(frame: NSRect(origin: .zero, size: image.size))
         iv.image = image
-        iv.imageScaling = .scaleAxesIndependently   // fills its frame; magnification does the zoom
+        iv.imageScaling = .scaleProportionallyUpOrDown   // preserve aspect; magnification does the zoom
         scroll.documentView = iv
         win.contentView = scroll
 

@@ -88,10 +88,14 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
         let storage = NSTextStorage()
         let layout = CodeCardLayoutManager()   // draws code blocks as rounded cards
         storage.addLayoutManager(layout)
-        // Non-contiguous layout: TextKit 1 lays out only what's needed (≈ the viewport)
-        // instead of the whole document up front — the key lever for opening and scrolling
-        // long documents fast with low memory.
-        layout.allowsNonContiguousLayout = true
+        // CONTIGUOUS layout. We deliberately precompute the whole document's layout anyway (for a
+        // complete scroll bar from the start), so non-contiguous layout's "lay out only the
+        // viewport" benefit is already given up. Worse, with non-contiguous layout every attachment
+        // edit (a diagram/image loading) drops the layout below it and reverts the total height to
+        // an ESTIMATE for a frame — which is exactly the scroll-bar jitter. Contiguous layout keeps
+        // the full layout, so an unchanged-size edit re-renders just that glyph and the height (and
+        // scroll bar) never move.
+        layout.allowsNonContiguousLayout = false
         let container = NSTextContainer(size: NSSize(width: 600, height: CGFloat.greatestFiniteMagnitude))
         // Wrap at an EXPLICIT container width (set in updateTextInset) rather than tracking
         // the text view — tracking left the view too wide, so text overflowed the window.
@@ -134,7 +138,51 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
     /// The live text storage, so the document layer can swap mermaid placeholders in place.
     var textStorageRef: NSTextStorage? { textView.textStorage }
 
+    /// Redraw just the glyphs for a character range WITHOUT invalidating layout — used when a media
+    /// attachment's IMAGE toggles (load/purge) but its reserved size (owned by SizedAttachmentCell)
+    /// is unchanged. Touching layout here would resize the frame from a partial usedRect mid-scroll
+    /// (the scroll-bar jitter); this only repaints, so the frame/scroll bar never move.
+    func redrawGlyphs(_ r: NSRange) {
+        guard let lm = textView.layoutManager, let tc = textView.textContainer else { return }
+        let gr = lm.glyphRange(forCharacterRange: r, actualCharacterRange: nil)
+        var rect = lm.boundingRect(forGlyphRange: gr, in: tc)
+        rect.origin.x += textView.textContainerInset.width
+        rect.origin.y += textView.textContainerInset.height
+        textView.setNeedsDisplay(rect)
+    }
+
     // MARK: - Zoom anchor (keep the top visible line stable across a font-size change)
+
+    private var layoutToken = 0
+
+    /// Lay out the ENTIRE document up front (media are placeholders, so this is cheap — no images
+    /// are rasterized) so the scroll bar reflects the full length immediately: the reader sees how
+    /// much content there is without scrolling. Done in small chunks across run-loop turns to keep
+    /// the UI responsive; aborts if the document changes.
+    func precomputeLayout() {
+        layoutToken += 1
+        let token = layoutToken
+        guard let lm = textView.layoutManager, let storage = textView.textStorage else { return }
+        let total = storage.length
+        let chunk = 20_000
+        func step(_ loc: Int) {
+            guard token == self.layoutToken, loc < total, self.textView.textStorage?.length == total else { return }
+            let end = min(loc + chunk, total)
+            lm.ensureLayout(forCharacterRange: NSRange(location: loc, length: end - loc))
+            if end < total { DispatchQueue.main.async { step(end) } }
+        }
+        DispatchQueue.main.async { step(0) }
+    }
+
+    /// Visible character range grown by `margin` screenfuls above and below — the region whose
+    /// images/diagrams should stay loaded. (Also lays that region out, which smooths scrolling.)
+    func visibleCharRange(margin: CGFloat) -> NSRange {
+        guard let lm = textView.layoutManager, let tc = textView.textContainer,
+              let storage = textView.textStorage, storage.length > 0 else { return NSRange(location: 0, length: 0) }
+        let rect = textView.visibleRect.insetBy(dx: 0, dy: -textView.visibleRect.height * margin)
+        let gr = lm.glyphRange(forBoundingRect: rect, in: tc)
+        return lm.characterRange(forGlyphRange: gr, actualGlyphRange: nil)
+    }
 
     /// The character index currently at the top of the visible area.
     func topVisibleCharIndex() -> Int {
@@ -200,6 +248,9 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.placeCopyButtons()
+            // Free off-screen images/diagrams and reload near-screen ones (memory bounded to the
+            // viewport on long docs).
+            (self.document as? MarkdownDocument)?.reconcileMedia(in: self)
             // Scroll has settled: repaint the whole visible area once so any card/quote background
             // torn by copy-on-scroll blitting is drawn clean (mid-scroll tearing is acceptable).
             self.textView.setNeedsDisplay(self.textView.visibleRect)
@@ -292,10 +343,14 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
             self.textView.addSubview(divider)
             self.codeOverlays.append(divider)
 
+            // Header strip runs from the card's top edge to the divider; center its chrome in it.
+            let cardTopY = headerY - 2 - CodeCardMetrics.verticalPadding
+            let bandCenterY = (cardTopY + (headerY + 18)) / 2
+
             // Language label on the left of the header (e.g. "SWIFT", "PYTHON").
             if !lang.isEmpty {
                 let label = self.makeLangLabel(lang)
-                label.setFrameOrigin(NSPoint(x: blockLeft + CodeCardMetrics.textInset, y: headerY + 1))
+                label.setFrameOrigin(NSPoint(x: blockLeft + CodeCardMetrics.textInset, y: bandCenterY - label.frame.height / 2))
                 self.textView.addSubview(label)
                 self.codeOverlays.append(label)
             }
@@ -310,8 +365,9 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
                 bg: wrapping ? Palette.link.withAlphaComponent(0.16) : .clear,
                 weight: wrapping ? .semibold : .regular,
                 action: #selector(self.toggleWrap(_:)), code: code)
-            copy.setFrameOrigin(NSPoint(x: cardRight - copy.frame.width - 6, y: headerY))
-            wrap.setFrameOrigin(NSPoint(x: copy.frame.minX - wrap.frame.width - 4, y: headerY))
+            let btnY = bandCenterY - copy.frame.height / 2
+            copy.setFrameOrigin(NSPoint(x: cardRight - copy.frame.width - 6, y: btnY))
+            wrap.setFrameOrigin(NSPoint(x: copy.frame.minX - wrap.frame.width - 4, y: btnY))
             self.textView.addSubview(copy)   // buttons on top of any overlay
             self.textView.addSubview(wrap)
             self.codeOverlays.append(copy); self.codeOverlays.append(wrap)

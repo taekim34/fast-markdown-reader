@@ -15,6 +15,28 @@ final class MermaidRenderer {
     private var memo: [String: NSImage] = [:]
     private var webView: WKWebView?
 
+    /// The natural size of a diagram if it is ALREADY cached on disk (reads the PDF header, no
+    /// render) — so its exact area can be reserved up front. nil if not cached yet.
+    static func cachedSize(source: String) -> NSSize? {
+        let key = MermaidCache.key(source: source, version: version)
+        guard let pdf = MermaidCache.pdf(forKey: key), let rep = NSPDFImageRep(data: pdf) else { return nil }
+        let s = rep.size
+        return (s.width > 0 && s.height > 0) ? s : nil
+    }
+
+    /// Render to the DISK cache only and return the diagram's size — WITHOUT retaining the NSImage
+    /// in `memo`. Used by the up-front measure pass so every diagram is cached (and thus exactly
+    /// sizeable) before layout, without holding all images in RAM (pixels load lazily per viewport).
+    func prerenderToCache(source: String) async -> NSSize? {
+        let key = MermaidCache.key(source: source, version: Self.version)
+        if let sz = Self.cachedSize(source: source) { return sz }
+        guard let data = await renderViaWebView(source: source), data.count > 512,
+              let rep = NSPDFImageRep(data: data) else { return nil }
+        MermaidCache.store(data, forKey: key)   // never cache empty/failed renders
+        let s = rep.size
+        return (s.width > 0 && s.height > 0) ? s : nil
+    }
+
     /// Returns a rendered diagram image, or nil on failure. Uses caches first.
     func renderImage(source: String) async -> NSImage? {
         let key = MermaidCache.key(source: source, version: Self.version)

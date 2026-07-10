@@ -1,4 +1,5 @@
 import AppKit
+import ImageIO
 
 final class MarkdownDocument: NSDocument {
     private(set) var text: String = ""
@@ -6,6 +7,13 @@ final class MarkdownDocument: NSDocument {
     // C3: bumped on every full render; async mermaid swaps from a previous render carry
     // a stale generation and abort before mutating, so only the latest render wins.
     private var renderGeneration = 0
+
+    // While the up-front measure pass is rendering uncached diagrams, their exact size isn't known
+    // yet — reconcileMedia must NOT load them (that would resize under the reader). Cleared once the
+    // pass finishes and every diagram has been sized. `prerenderToken` cancels a stale pass when a
+    // new render starts.
+    private var isPrerendering = false
+    private var prerenderToken = 0
 
     override class var autosavesInPlace: Bool { false }
     // The text view is editable only to show a caret; edits are rejected, so the document is
@@ -21,6 +29,9 @@ final class MarkdownDocument: NSDocument {
         let wc = DocumentWindowController()
         addWindowController(wc)
         wc.window?.setFrameAutosaveName("FastMDReaderDoc")
+        // Record the file in Open Recent. Auto-recording wasn't firing for our open paths, so note
+        // it explicitly (idempotent — the controller de-dupes).
+        if let url = fileURL { NSDocumentController.shared.noteNewRecentDocumentURL(url) }
         render(into: wc)
     }
 
@@ -80,72 +91,218 @@ final class MarkdownDocument: NSDocument {
         wc.display(attr)
         wc.window?.title = displayName ?? "fast-md-reader"
         renderGeneration += 1
-        renderMermaid(in: wc, generation: renderGeneration)
-        renderImages(in: wc, generation: renderGeneration)
+        DispatchQueue.main.async { [weak self, weak wc] in
+            guard let self, let wc else { return }
+            // Reserve EXACT area up front wherever the size is known cheaply — local images
+            // (ImageIO header) and already-cached diagrams (cached PDF size). Then loading only
+            // toggles the drawing (pixels), never the geometry, so the scroll bar stays stable.
+            self.presizeKnownMedia(in: wc)
+            // Lay out the WHOLE document up front (media are just placeholders, so it's cheap): the
+            // scrollbar then reflects the full length immediately — the user sees how much content
+            // there is without scrolling. Content itself streams in lazily via reconcileMedia.
+            wc.precomputeLayout()
+            self.reconcileMedia(in: wc)   // load only what's on screen now
+            // Then, in the background, render EVERY uncached diagram to the disk cache so its exact
+            // size is known — the scrollbar becomes correct and never resizes again as you scroll
+            // (the whole point: uncached docs behave like cached ones). Cached docs skip this.
+            self.prerenderAllDiagrams(in: wc)
+        }
     }
 
-    // MARK: - Images (async attachment fill, mirrors the mermaid pattern)
+    /// The up-front measure pass. On the FIRST open of a diagram-heavy document nothing is cached,
+    /// so each diagram's real height is unknown and loading it on scroll would resize the layout
+    /// under the reader (the scroll-bar jitter). Here we render every uncached diagram to the disk
+    /// cache in the background (bounded concurrency for memory), and once they're ALL sized we
+    /// reserve each exact area and lay the document out ONCE. After this, sizes never change, so
+    /// scrolling only ever draws pixels — no reflow, no jitter. Second open onward: all cached, so
+    /// there's nothing to render and presizeKnownMedia already reserved exact areas.
+    func prerenderAllDiagrams(in wc: DocumentWindowController) {
+        guard let storage = wc.textStorageRef else { return }
+        var codes: [String] = []
+        var seen = Set<String>()
+        storage.enumerateAttribute(MDAttr.mermaid, in: NSRange(location: 0, length: storage.length)) { v, _, _ in
+            guard let code = v as? String, seen.insert(code).inserted else { return }
+            if MermaidRenderer.cachedSize(source: code) == nil { codes.append(code) }
+        }
+        guard !codes.isEmpty else { return }   // all cached → already presized to exact areas
+        isPrerendering = true
+        prerenderToken += 1
+        let token = prerenderToken
+        let gen = renderGeneration
+        Task { @MainActor in
+            // A few diagrams render at once (each on its OWN MermaidRenderer so their web views
+            // don't collide); a small cap keeps the transient WebKit memory modest.
+            let cap = min(3, codes.count)
+            var next = 0
+            await withTaskGroup(of: Void.self) { group in
+                func pump() {
+                    guard next < codes.count else { return }
+                    let code = codes[next]; next += 1
+                    group.addTask { @MainActor in _ = await MermaidRenderer().prerenderToCache(source: code) }
+                }
+                for _ in 0..<cap { pump() }
+                while await group.next() != nil {
+                    guard token == self.prerenderToken, gen == self.renderGeneration else { break }
+                    pump()
+                }
+            }
+            guard token == self.prerenderToken, gen == self.renderGeneration else { return }
+            self.isPrerendering = false
+            // Every diagram is cached now → reserve each EXACT area, lay the whole doc out once
+            // (scroll bar becomes correct), keep the reader's position, then fill visible pixels.
+            let anchor = wc.topVisibleCharIndex()
+            self.presizeKnownMedia(in: wc)
+            wc.precomputeLayout()
+            wc.scrollCharToTop(anchor)
+            self.reconcileMedia(in: wc)
+        }
+    }
+
+    // MARK: - Images / diagrams (lazy: only on-screen media hold pixels)
 
     /// Decoded-image cache keyed by resolved absolute URL string (muya's loadImageMap).
     private static let imageCache = NSCache<NSString, NSImage>()
 
-    private func renderImages(in wc: DocumentWindowController, generation: Int) {
-        guard let storage = wc.textStorageRef else { return }
-        var jobs: [(NSRange, String)] = []
-        storage.enumerateAttribute(MDAttr.image, in: NSRange(location: 0, length: storage.length)) { v, r, _ in
-            if let src = v as? String, !src.isEmpty { jobs.append((r, src)) }
+    /// Column-fit a raw pixel size, honoring an explicit width (HTML/Pandoc/Obsidian) or shrinking
+    /// oversized images to the column width.
+    private func fittedSize(_ pixelSize: NSSize, _ storage: NSTextStorage, _ range: NSRange, maxWidth: CGFloat) -> NSSize {
+        let colW = maxWidth - 8
+        var size = pixelSize
+        guard size.width > 0 else { return size }
+        var targetW: CGFloat?
+        if let pct = (storage.attribute(MDAttr.imageWidthPct, at: range.location, effectiveRange: nil) as? NSNumber)?.doubleValue {
+            targetW = colW * CGFloat(pct)
+        } else if let pts = (storage.attribute(MDAttr.imageWidth, at: range.location, effectiveRange: nil) as? NSNumber)?.doubleValue {
+            targetW = min(CGFloat(pts), colW)
+        } else if size.width > colW {
+            targetW = colW
         }
-        guard !jobs.isEmpty else { return }
+        if let targetW {
+            let s = targetW / size.width
+            size = NSSize(width: targetW.rounded(), height: (size.height * s).rounded())
+        }
+        return size
+    }
+
+    /// Reserve the exact column-fitted area for media whose size is known WITHOUT rendering: local
+    /// images (ImageIO header) and already-cached diagrams (cached PDF size). Runs once after render,
+    /// before the full layout, so those never resize on load. Uncached diagrams / remote images keep
+    /// their placeholder until first load.
+    private func presizeKnownMedia(in wc: DocumentWindowController) {
+        guard let storage = wc.textStorageRef else { return }
         let maxWidth = wc.textView.textContainer?.size.width ?? 800
         let baseDir = fileURL?.deletingLastPathComponent()
+        let whole = NSRange(location: 0, length: storage.length)
+        var sets: [(NSSize, NSRange)] = []
+        storage.enumerateAttribute(MDAttr.image, in: whole) { v, r, _ in
+            guard let src = v as? String, !src.hasPrefix("data:"),
+                  let url = self.resolveImageURL(src, baseDir: baseDir), url.isFileURL,
+                  let px = MarkdownDocument.imagePixelSize(url) else { return }
+            sets.append((px, r))
+        }
+        storage.enumerateAttribute(MDAttr.mermaid, in: whole) { v, r, _ in
+            guard let code = v as? String, let sz = MermaidRenderer.cachedSize(source: code) else { return }
+            sets.append((sz, r))
+        }
+        for (px, r) in sets {
+            guard r.location < storage.length,
+                  let att = storage.attribute(.attachment, at: r.location, effectiveRange: nil) as? NSTextAttachment,
+                  let cell = att.attachmentCell as? SizedAttachmentCell else { continue }
+            let fitted = fittedSize(px, storage, r, maxWidth: maxWidth)
+            cell.reservedSize = fitted           // the cell owns layout size (survives image==nil)
+            att.bounds = NSRect(origin: .zero, size: fitted)
+            storage.edited(.editedAttributes, range: r, changeInLength: 0)
+        }
+    }
 
-        for (range, src) in jobs {
-            let apply: (NSImage?) -> Void = { [weak self, weak wc] image in
-                guard let self, let wc, generation == self.renderGeneration else { return }
-                guard let storage = wc.textStorageRef, range.location < storage.length,
-                      let att = storage.attribute(.attachment, at: range.location, effectiveRange: nil) as? NSTextAttachment
-                else { return }
-                let img = image ?? MarkdownDocument.brokenImage()
-                let colW = maxWidth - 8
-                var size = img.size
-                if size.width > 0 {
-                    // Explicit width (HTML/Pandoc/Obsidian) wins, capped to the column; otherwise
-                    // only shrink oversized images to fit. No height cap (tall webtoons stay tall).
-                    var targetW: CGFloat?
-                    if let pct = (storage.attribute(MDAttr.imageWidthPct, at: range.location, effectiveRange: nil) as? NSNumber)?.doubleValue {
-                        targetW = colW * CGFloat(pct)
-                    } else if let pts = (storage.attribute(MDAttr.imageWidth, at: range.location, effectiveRange: nil) as? NSNumber)?.doubleValue {
-                        targetW = min(CGFloat(pts), colW)
-                    } else if size.width > colW {
-                        targetW = colW
-                    }
-                    if let targetW {
-                        let s = targetW / size.width
-                        size = NSSize(width: targetW.rounded(), height: (size.height * s).rounded())
-                    }
-                }
-                att.image = img
-                att.bounds = NSRect(origin: .zero, size: size)
-                // Force the attachment glyph to be re-measured + redrawn at its new size.
-                storage.beginEditing()
-                storage.edited(.editedAttributes, range: range, changeInLength: 0)
-                storage.endEditing()
-                wc.refreshAfterImageFill()
-            }
-            // data: URI decodes inline; everything else resolves to a URL and loads off-thread.
-            if src.hasPrefix("data:") {
-                apply(MarkdownDocument.decodeDataURI(src))
-            } else if let url = resolveImageURL(src, baseDir: baseDir) {
-                if let cached = MarkdownDocument.imageCache.object(forKey: url.absoluteString as NSString) {
-                    apply(cached)
-                } else {
-                    MarkdownDocument.loadImage(url) { image in
-                        if let image { MarkdownDocument.imageCache.setObject(image, forKey: url.absoluteString as NSString) }
-                        apply(image)
-                    }
-                }
+    /// The core of the lazy scheme: on-screen images/diagrams hold their pixels; those far from the
+    /// viewport drop them (bounds stay, so no reflow); reload from cache when they come back near.
+    /// Text is left alone — it's tiny and non-contiguous layout already purges its off-screen glyphs.
+    /// Called after render and on every scroll-settle. All work here is main-thread.
+    func reconcileMedia(in wc: DocumentWindowController) {
+        guard let storage = wc.textStorageRef else { return }
+        let keep = wc.visibleCharRange(margin: 1.5)   // ±1.5 screens stay loaded
+        guard keep.length > 0 else { return }
+        let whole = NSRange(location: 0, length: storage.length)
+        let baseDir = fileURL?.deletingLastPathComponent()
+        let maxWidth = wc.textView.textContainer?.size.width ?? 800
+        let gen = renderGeneration
+        func onScreen(_ r: NSRange) -> Bool { NSIntersectionRange(r, keep).length > 0 }
+        func attach(_ r: NSRange) -> NSTextAttachment? {
+            storage.attribute(.attachment, at: r.location, effectiveRange: nil) as? NSTextAttachment
+        }
+        // Load: set the image AND its real fitted bounds (placeholder → actual). Reload gives the
+        // same size, so it's stable. Purge: drop the image, keep bounds (no reflow).
+        func load(_ image: NSImage?, _ r: NSRange) {
+            guard gen == self.renderGeneration, r.location < storage.length,
+                  let att = attach(r), let cell = att.attachmentCell as? SizedAttachmentCell else { return }
+            let img = image ?? MarkdownDocument.brokenImage()
+            let newSize = self.fittedSize(img.size, storage, r, maxWidth: maxWidth)
+            let sizeChanged = abs(cell.reservedSize.height - newSize.height) > 0.5 || abs(cell.reservedSize.width - newSize.width) > 0.5
+            att.image = img
+            if sizeChanged {
+                // Reserved size was only a guess (uncached diagram / remote image) — correct it, which
+                // DOES reflow. Rare after the up-front measure pass (which pre-sizes every diagram).
+                cell.reservedSize = newSize
+                att.bounds = NSRect(origin: .zero, size: newSize)
+                storage.edited(.editedAttributes, range: r, changeInLength: 0)
+                wc.textView.layoutManager?.ensureLayout(forCharacterRange:
+                    NSRange(location: r.location, length: storage.length - r.location))
             } else {
-                apply(nil)
+                // Reserved size already exact → just paint the pixels. No layout touch → the frame
+                // height and scroll bar do not move at all.
+                wc.redrawGlyphs(r)
+            }
+            wc.refreshAfterImageFill()
+        }
+        func purgeAt(_ r: NSRange) {
+            guard r.location < storage.length, let att = attach(r) else { return }
+            att.image = nil                 // reserved size (cell) unchanged → space kept, no reflow
+            wc.redrawGlyphs(r)              // repaint the now-empty reserved area
+        }
+
+        // Collect first (don't mutate storage while enumerating its attributes).
+        var purge: [NSRange] = [], imgLoad: [(String, NSRange)] = [], mmLoad: [(String, NSRange)] = []
+        storage.enumerateAttribute(MDAttr.image, in: whole) { v, r, _ in
+            guard let src = v as? String, !src.isEmpty, let att = attach(r) else { return }
+            if onScreen(r) { if att.image == nil { imgLoad.append((src, r)) } }
+            else if att.image != nil { purge.append(r) }
+        }
+        storage.enumerateAttribute(MDAttr.mermaid, in: whole) { v, r, _ in
+            guard let code = v as? String, let att = attach(r) else { return }
+            if onScreen(r) {
+                guard att.image == nil else { return }
+                // During the up-front pass an uncached diagram has no exact size yet — loading it
+                // now would resize the layout under the reader. Wait for the pass to size it; a
+                // cached one is already exact, so it's safe to fill.
+                if self.isPrerendering && MermaidRenderer.cachedSize(source: code) == nil { return }
+                mmLoad.append((code, r))
+            }
+            else if att.image != nil { purge.append(r) }
+        }
+
+        for r in purge { purgeAt(r) }
+        for (src, r) in imgLoad {
+            if src.hasPrefix("data:") {
+                load(MarkdownDocument.decodeDataURI(src), r)
+            } else if let url = resolveImageURL(src, baseDir: baseDir) {
+                if let c = MarkdownDocument.imageCache.object(forKey: url.absoluteString as NSString) {
+                    load(c, r)
+                } else {
+                    MarkdownDocument.loadImage(url) { [weak wc] img in
+                        if let img { MarkdownDocument.imageCache.setObject(img, forKey: url.absoluteString as NSString) }
+                        if wc != nil { load(img, r) }
+                    }
+                }
+            } else { load(nil, r) }
+        }
+        if !mmLoad.isEmpty {
+            let renderer = MermaidRenderer()   // cache-first: reloads hit the disk cache, no WebKit
+            Task { @MainActor in
+                for (code, r) in mmLoad {
+                    guard let img = await renderer.renderImage(source: code) else { continue }
+                    load(img, r)
+                }
             }
         }
     }
@@ -156,6 +313,16 @@ final class MarkdownDocument: NSDocument {
         if src.hasPrefix("/") { return URL(fileURLWithPath: src) }
         if let baseDir { return baseDir.appendingPathComponent(src).standardizedFileURL }   // relative to the doc
         return nil
+    }
+
+    /// Pixel dimensions of an image WITHOUT decoding it (ImageIO reads only the header) — fast and
+    /// cheap, so a local image's exact height can be reserved before its pixels load.
+    private static func imagePixelSize(_ url: URL) -> NSSize? {
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+              let w = props[kCGImagePropertyPixelWidth] as? Double,
+              let h = props[kCGImagePropertyPixelHeight] as? Double, w > 0, h > 0 else { return nil }
+        return NSSize(width: w, height: h)
     }
 
     private static func loadImage(_ url: URL, completion: @escaping (NSImage?) -> Void) {
@@ -189,41 +356,4 @@ final class MarkdownDocument: NSDocument {
     /// Swap each mermaid placeholder for a rendered PDF image. Runs async so text opens
     /// instantly with placeholders and diagrams stream in. A no-mermaid document does no
     /// work here and never touches WebKit.
-    private func renderMermaid(in wc: DocumentWindowController, generation: Int) {
-        guard let storage = wc.textStorageRef else { return }
-        var jobs: [(NSRange, String)] = []
-        storage.enumerateAttribute(MDAttr.mermaid, in: NSRange(location: 0, length: storage.length)) { v, r, _ in
-            if let src = v as? String { jobs.append((r, src)) }
-        }
-        guard !jobs.isEmpty else { return }
-        let maxWidth = wc.textView.textContainer?.size.width ?? 800
-        let renderer = MermaidRenderer()
-        // Weak captures so closing a document mid-render never keeps the document, its
-        // window controller, or its text storage alive until the render finishes.
-        Task { @MainActor [weak self, weak wc] in
-            for (range, src) in jobs.reversed() { // reversed so earlier ranges stay valid
-                guard let self, generation == self.renderGeneration else { return }  // C3: stale/closed aborts
-                guard let storage = wc?.textStorageRef else { return }
-                guard let image = await renderer.renderImage(source: src) else { continue }
-                guard generation == self.renderGeneration else { return }            // re-check after await
-                // Scale to fit the text width, preserving aspect (avoids horizontal scroll).
-                var size = image.size
-                if size.width > maxWidth, size.width > 0 {
-                    let s = (maxWidth - 8) / size.width
-                    size = NSSize(width: maxWidth - 8, height: size.height * s)
-                }
-                let att = NSTextAttachment()
-                att.image = image
-                att.bounds = NSRect(origin: .zero, size: size)
-                // Guard the range against text that shifted underneath us.
-                guard range.location + range.length <= storage.length else { continue }
-                // Keep MDAttr.mermaid on the swapped-in image so a click can reopen it enlarged.
-                let attStr = NSMutableAttributedString(attachment: att)
-                attStr.addAttribute(MDAttr.mermaid, value: src, range: NSRange(location: 0, length: attStr.length))
-                storage.replaceCharacters(in: range, with: attStr)
-            }
-            guard let self, generation == self.renderGeneration else { return }
-            wc?.refreshAfterMutation()
-        }
-    }
 }

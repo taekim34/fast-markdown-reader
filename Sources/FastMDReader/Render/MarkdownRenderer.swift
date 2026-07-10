@@ -185,7 +185,12 @@ private struct AttributedBuilder: MarkupWalker {
 
     private func imageString(source: String, alt: String, widthPts: CGFloat?, widthPct: CGFloat?) -> NSMutableAttributedString {
         let att = NSTextAttachment()
-        att.bounds = NSRect(x: 0, y: 0, width: 1, height: 1)
+        // A custom cell OWNS the layout size so image==nil (not-yet-loaded / purged) still reserves
+        // the area — the default cell would collapse to zero and make the scroll bar swing. Real
+        // size is applied to the cell right after (local images) or on first load (remote).
+        let ph = NSSize(width: (widthPts ?? 480), height: 360)
+        att.bounds = NSRect(origin: .zero, size: ph)
+        att.attachmentCell = SizedAttachmentCell(reservedSize: ph)
         let out = NSMutableAttributedString(attachment: att)
         let whole = NSRange(location: 0, length: out.length)
         out.addAttribute(MDAttr.image, value: source, range: whole)
@@ -463,9 +468,14 @@ private struct AttributedBuilder: MarkupWalker {
         let blockStart = result.length
         // mermaid handled in Task 5; here treat everything else as a highlighted block.
         if (codeBlock.language ?? "").lowercased() == "mermaid" {
-            // Placeholder line the document layer replaces with a rendered PDF attachment.
-            let ph = NSMutableAttributedString(string: "⧗ rendering diagram…",
-                attributes: [.font: theme.codeFont, .foregroundColor: theme.secondaryColor])
+            // Empty attachment holding a PLACEHOLDER area (real size applied on first load, when the
+            // document layer renders it). It's a real attachment from the start so the lazy media
+            // manager treats it exactly like an image (load when on-screen, drop when far).
+            let att = NSTextAttachment()
+            let phSize = NSSize(width: 480, height: 360)   // approx; exact size set at pre-measure
+            att.bounds = NSRect(origin: .zero, size: phSize)
+            att.attachmentCell = SizedAttachmentCell(reservedSize: phSize)   // owns size when image==nil
+            let ph = NSMutableAttributedString(attachment: att)
             ph.addAttribute(MDAttr.mermaid, value: codeBlock.code,
                             range: NSRange(location: 0, length: ph.length))
             result.append(ph); newline(2)
