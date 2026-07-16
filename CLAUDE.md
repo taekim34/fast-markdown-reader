@@ -42,8 +42,10 @@ No web runtime for text; mermaid is the only WebKit user and only on a cache mis
 ## Commit / distribution
 
 - **Solo local app → commit directly to `main`** (established pattern: `a80271e`, `57b485b`, `bce0ead`). No dev branch. Stage by filename (exclude `.bkit/`).
+- **`docs/` is gitignored — local only, NOT on GitHub** (this repo is public and the AI collaboration logs quote internal discussion verbatim; GitHub can't keep a folder private inside a public repo). The distribution playbooks (`docs/NOTARIZATION.md`, `docs/APP-STORE.md`) live there too, so they exist on this machine only — **don't link to them from README** (public readers would hit a dead path), and don't assume a fresh clone has them.
 - **Two distribution tracks, both arm64-only, both from this SwiftPM build — no Xcode project:**
-  - **Direct (`./Scripts/notarize.sh`)** — Developer ID + hardened runtime + Apple notarization → stapled `FastMDReader.zip`. Recipients double-click; no quarantine step. Run it only when shipping a build to someone, not per build. → `docs/NOTARIZATION.md`
-  - **Mac App Store (`./Scripts/appstore.sh`)** — Apple Distribution + embedded profile → signed `.pkg` → `altool`. Defaults to validate-only; `--upload` submits. The store notarizes during review, so this track never calls notarytool. → `docs/APP-STORE.md`
+  - **Direct (`./Scripts/notarize.sh`)** — Developer ID + hardened runtime + Apple notarization → stapled `FastMDReader.zip`. Recipients double-click; no quarantine step. Run it only when shipping a build to someone, not per build. → `docs/NOTARIZATION.md` (local)
+  - **Mac App Store (`./Scripts/appstore.sh`)** — Apple Distribution + embedded profile → signed `.pkg` → `altool`. Defaults to validate-only; `--upload` submits. The store notarizes during review, so this track never calls notarytool. → `docs/APP-STORE.md` (local)
+- **Signing identity / key ids are NOT in the repo** — scripts source `$KEYCHAIN_DIR/signing.env` (default `~/Documents/DEV/ww-w-ai/.keychains/`, chmod 600) and fail loudly naming the missing variable. Never re-add them as script defaults.
 - `make-app.sh` alone is ad-hoc signed — runs on the building machine only. Never ship that bundle. It signs WITH the sandbox entitlements on purpose: a dev build that skips the sandbox hides the exact failures (file access, WKWebView) that would surface in review.
 - Intel support needs a universal build (`swift build --arch arm64 --arch x86_64`) before packaging.

@@ -69,7 +69,14 @@ Notes:
 - The plain `./Scripts/make-app.sh` build is **ad-hoc signed** — fine on the machine that built
   it, but other Macs will block it. Only ship the notarized zip.
 - Apple's first submission for a new app can take ~15 minutes; later ones are usually under a
-  minute. Setup and troubleshooting: `docs/NOTARIZATION.md`.
+  minute.
+- Signing identity and App Store Connect key ids are **not** in this repo. The scripts read them
+  from `$KEYCHAIN_DIR/signing.env` (default `~/Documents/DEV/ww-w-ai/.keychains/`) and say which
+  variable is missing if it isn't there. To sign as yourself, write your own — no code changes:
+  ```bash
+  export IDENTITY="Developer ID Application: <You> (<TEAMID>)"
+  export NOTARY_PROFILE="<your notarytool keychain profile>"
+  ```
 
 ## Keyboard (reading cursor)
 
