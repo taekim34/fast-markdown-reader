@@ -43,6 +43,15 @@ echo "==> Building release"
 echo "==> Embedding the provisioning profile"
 cp "$PROFILE" "$APP/Contents/embedded.provisionprofile"
 
+# Strip extended attributes from the whole bundle before signing. The profile was downloaded in a
+# browser, so macOS tagged it com.apple.quarantine — and that tag rides along into the .pkg, which
+# App Store Connect rejects on ingest:
+#   ITMS-91109: Invalid package contents — the package contains one or more files with the
+#   com.apple.quarantine extended file attribute … isn't permitted on TestFlight or the App Store.
+# It cost builds 1-3. Clearing the bundle (not just the profile) also covers any other file that
+# picks up an attribute from a download or a copy.
+xattr -cr "$APP"
+
 echo "==> Signing with Apple Distribution (App Store entitlements)"
 # Hardened runtime is not required for the store (the sandbox is), and --deep is deprecated —
 # the bundle is a single binary anyway.

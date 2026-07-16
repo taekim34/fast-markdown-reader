@@ -12,7 +12,9 @@ outside the viewport **release their pixels but keep their exact height**, so me
 the scrollbar never jumps
 ([`SizedAttachmentCell.swift`](Sources/FastMDReader/Render/SizedAttachmentCell.swift)).
 
-Read-only, on purpose. It opens, renders, and gets out of the way.
+A reader, on purpose — it opens, renders, and gets out of the way. When something in the text is
+wrong, right-click that block and **Edit** rewrites just its Markdown source back to the file. Fix
+the typo, keep reading; no editor, no mode switch.
 
 | | Fast Markdown Reader |
 |---|---|
@@ -23,7 +25,7 @@ Read-only, on purpose. It opens, renders, and gets out of the way.
 | Diagrams | **mermaid bundled** — renders offline, cached as vector PDF, never re-rendered |
 | Images | Off-screen pixels freed, exact height kept — **no reflow, no scrollbar jitter** |
 | Code | Native syntax highlighting, per-block **Copy** and **Wrap** |
-| Editing | None. Read-only viewer, opens files read-only |
+| Editing | Reader first — but right-click any block → **Edit** fixes its Markdown source in place |
 
 ## Diagrams render offline, once
 
@@ -114,6 +116,10 @@ stays free for system selection), and the keys avoid conflicts with standard mac
 
 Page / number-jump / document-ends move without selecting. Mouse drag-selection and copy work as
 usual. Click any diagram or image to open it in a zoomable window (pinch, `+`/`−`, `0` to fit).
+
+**Fix a typo without leaving:** right-click a block → **Edit** opens just that block's Markdown
+source; **⌘↵** writes it back to the file, **esc** discards. That is the only action that ever
+writes to your document.
 
 ## License
 
