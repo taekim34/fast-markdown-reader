@@ -62,15 +62,34 @@ final class CenteringClipView: NSClipView {
 /// A standalone, zoomable window for viewing a rendered diagram (mermaid) enlarged. The image is
 /// PDF-backed (vector), so NSScrollView magnification stays crisp at any zoom level.
 final class DiagramZoomWindowController: NSWindowController, NSWindowDelegate {
-    // Retain open zoom windows until they close (a window controller isn't held by anything else).
-    private static var open: [DiagramZoomWindowController] = []
+    // At most ONE zoom window: clicking a second diagram swaps this one's content instead of piling
+    // up windows. Also retains the controller, which nothing else holds.
+    private static var current: DiagramZoomWindowController?
     private let scroll = ZoomScrollView()
 
     static func show(_ image: NSImage) {
+        if let c = current {
+            c.replace(with: image)
+            c.window?.makeKeyAndOrderFront(nil)
+            return
+        }
         let c = DiagramZoomWindowController(image: image)
-        open.append(c)
+        current = c
         c.showWindow(nil)
         c.window?.makeKeyAndOrderFront(nil)
+    }
+
+    /// Swap the displayed image, resetting zoom to fit — the previous diagram's magnification and
+    /// scroll offset mean nothing for a different image.
+    private func replace(with image: NSImage) {
+        let iv = NSImageView(frame: NSRect(origin: .zero, size: image.size))
+        iv.image = image
+        iv.imageScaling = .scaleProportionallyUpOrDown
+        scroll.documentView = iv
+        DispatchQueue.main.async { [weak self] in
+            self?.scroll.fit()
+            self?.window?.makeFirstResponder(self?.scroll)
+        }
     }
 
     private convenience init(image: NSImage) {
@@ -107,6 +126,6 @@ final class DiagramZoomWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
-        Self.open.removeAll { $0 === self }
+        if Self.current === self { Self.current = nil }
     }
 }
