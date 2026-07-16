@@ -1,6 +1,7 @@
 .build/
 *.app
 *.zip
+*.pkg
 DerivedData/
 .DS_Store
 .bkit/

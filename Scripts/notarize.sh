@@ -22,7 +22,10 @@ echo "==> Building release"
 echo "==> Signing with Developer ID + hardened runtime"
 # No --deep: the bundle is a single binary with no embedded frameworks or dylibs,
 # and Apple deprecated --deep for distribution signing.
-codesign --force --options runtime --timestamp --sign "$IDENTITY" "$APP"
+# Same sandbox entitlements as the App Store build — the sandbox is optional outside the store, but
+# shipping an unsandboxed build here would mean the widely-tested binary isn't the one under review.
+codesign --force --options runtime --timestamp \
+  --entitlements Resources/FastMDReader.entitlements --sign "$IDENTITY" "$APP"
 codesign --verify --strict --verbose=2 "$APP"
 
 echo "==> Submitting to Apple for notarization (takes a few minutes)"

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Mac App Store build. Same sandbox as the Developer ID build (FastMDReader.entitlements),
+	     PLUS the two identifiers the store requires: they must match the embedded provisioning
+	     profile exactly or the upload is rejected. Xcode injects these automatically; we build
+	     without an Xcode project, so they are declared here by hand. -->
+	<key>com.apple.application-identifier</key>
+	<string>GTX7V638TX.ai.ww-w.fast-md-reader</string>
+	<key>com.apple.developer.team-identifier</key>
+	<string>GTX7V638TX</string>
+
+	<key>com.apple.security.app-sandbox</key>
+	<true/>
+
+	<!-- The viewer only ever reads files the user picked (Open panel, Finder, Open Recent). -->
+	<key>com.apple.security.files.user-selected.read-only</key>
+	<true/>
+
+	<!-- Required for WKWebView even though mermaid loads ONLY a bundled local JS file and the app
+	     makes no network requests: a sandboxed WKWebView runs out-of-process and fails to load
+	     anything at all without this. Not a sign the app talks to the network — it doesn't. -->
+	<key>com.apple.security.network.client</key>
+	<true/>
+</dict>
+</plist>
