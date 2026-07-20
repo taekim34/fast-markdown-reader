@@ -22,6 +22,10 @@ wrong, right-click that block: **Edit** rewrites just its Markdown source, and *
 press ⌘S, and only the block you touched is redrawn — **9 ms on a 64,000-character file, 29 ms on
 1.2 MB**, so undo stays instant in documents where other apps stall.
 
+**T** brings up a sidebar of every heading, and clicking one moves the reading cursor there — so the
+next keystroke acts on that section. Press **⌘N** for a new file: Markdown starts with a small
+outline you can immediately edit, plain text starts empty.
+
 It opens **plain text too** — `.txt`, `.csv`, `.log` — shown verbatim in a fixed-width font, one
 block per line, with `#` and `*` left as the characters they are. Files written on Windows or Linux
 arrive intact: CP949, UTF-16, Latin-1 and friends are detected rather than assumed, and a file is
@@ -40,7 +44,8 @@ arrive intact: CP949, UTF-16, Latin-1 and friends are detected rather than assum
 | Math | **KaTeX bundled** — `$$…$$` and ```` ```math ```` render offline, vector, cached the same way |
 | Images | Off-screen pixels freed, exact height kept — **no reflow, no scrollbar jitter** |
 | Code | **34 languages** highlighted natively — one-pass scanner, no JS, per-block **Copy** and **Wrap** |
-| Editing | Reader first — right-click a block → **Edit · Add Below · Move · Delete**, saved on ⌘S |
+| Editing | Reader first — **E** edit · **I** add below · **U/J** move · **D** delete, saved on ⌘S |
+| Navigation | **T** opens a table of contents built from the document's own headings — click to jump |
 
 ## Diagrams render offline, once
 
@@ -102,9 +107,9 @@ file, which should open the instant you double-click it.
 Download the notarized zip, unzip it, drag `FastMDReader.app` to `/Applications`, double-click.
 No Gatekeeper prompt and no `xattr` step — the app is signed with a Developer ID and stapled.
 
-To open Markdown and text files here by default: **fast-md-reader → Open Text Files with
-fast-md-reader…**, which says exactly which kinds it will claim before it changes anything. Per
-file, the Finder route still works: right-click → **Get Info** → **Open with** → **Change All…**.
+To open files here by default: **fast-md-reader → Set as Default App…**, which lists the kinds it
+can claim with a checkbox each — Markdown ticked, text formats yours to choose. Per file, the Finder
+route still works: right-click → **Get Info** → **Open with** → **Change All…**.
 
 ## Build from source
 
@@ -162,7 +167,7 @@ Mouse:
 | Action | What it does |
 |---|---|
 | **Click the left margin** beside a block | Selects that whole block and copies it — a heading takes its entire section, a code block its raw source |
-| **Click a diagram, formula or image** | Opens it enlarged in a zoomable window (pinch, `+`/`−`, `0` to fit) |
+| **Click a diagram, formula or image** | Opens it enlarged in a zoomable window (pinch or `⌘+`/`⌘−`, `⌘0` to fit, `esc` to close) |
 | **Select text, then ⌘-click it** | Opens it — a file path, a URL, or a bare domain |
 | **Drag** | Ordinary text selection, as anywhere on the Mac |
 
