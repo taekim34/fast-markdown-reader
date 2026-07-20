@@ -43,7 +43,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // launch or otherwise — is hijacking a system-wide setting the user didn't touch, which the
         // App Store rejects and users rightly resent. This does it only when asked, and says
         // exactly which kinds of file it will claim before doing anything.
-        let defaults = appMenu.addItem(withTitle: "Open Text Files with \(appName)…",
+        let defaults = appMenu.addItem(withTitle: "Set as Default App…",
                                        action: #selector(offerToBecomeDefault(_:)), keyEquivalent: "")
         defaults.target = self
         appMenu.addItem(.separator())
@@ -57,6 +57,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // immediately in this code-menu / ad-hoc-signed SwiftPM app). Present our OWN NSOpenPanel and
         // route the result through openDocument(withContentsOf:) — the exact path Open Recent uses,
         // which is known-good.
+        let newItem = fileMenu.addItem(withTitle: "New File…", action: #selector(newFileDocument(_:)), keyEquivalent: "n")
+        newItem.target = self
         let openItem = fileMenu.addItem(withTitle: "Open…", action: #selector(openDocumentPanel(_:)), keyEquivalent: "o")
         openItem.target = self
         // Open Recent — AppKit's automatic population does NOT attach to a code-built menu (no
@@ -103,6 +105,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         viewMenu.addItem(withTitle: "Decrease Font Size", action: Selector(("decreaseReaderFontSize:")), keyEquivalent: "-")
         viewMenu.addItem(withTitle: "Actual Size", action: Selector(("resetReaderFontSize:")), keyEquivalent: "0")
         viewMenu.addItem(.separator())
+        // Table of contents — markdown with headings only; the window controller validates it, so
+        // it greys out for a .txt or a document that has no headings rather than opening empty.
+        let toc = viewMenu.addItem(withTitle: "Table of Contents",
+                                   action: Selector(("toggleTableOfContents:")), keyEquivalent: "t")
+        toc.keyEquivalentModifierMask = []   // a bare letter, like the block keys E/I/D/U/J
+        viewMenu.addItem(.separator())
         viewMenu.addItem(withTitle: "Reload", action: Selector(("reloadDocument:")), keyEquivalent: "r")
 
         // Window menu (minimize, zoom, native tabs)
@@ -121,34 +129,96 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.mainMenu = mainMenu
     }
 
+    // MARK: - New file
+
+    /// ⌘N. Asks which kind first, because the answer changes what the document IS here — markdown
+    /// is parsed into blocks, plain text is kept line for line — and picking wrong means starting
+    /// over. The choice is two buttons rather than a save panel with a type popup: the file has no
+    /// home yet, and asking where to put something before knowing what it is gets the order wrong.
+    @objc func newFileDocument(_ sender: Any?) {
+        let alert = NSAlert()
+        alert.messageText = "New file"
+        alert.informativeText = """
+            Markdown is rendered — headings, lists, tables — and starts with a small outline to \
+            edit. Plain text is shown exactly as typed, one block per line.
+
+            It is saved when you press ⌘S; until then it lives only here.
+            """
+        alert.addButton(withTitle: "Markdown  (Untitled.md)")
+        alert.addButton(withTitle: "Plain Text  (Untitled.txt)")
+        alert.addButton(withTitle: "Cancel")
+        let choice = alert.runModal()
+        guard choice != .alertThirdButtonReturn else { return }
+
+        let doc = MarkdownDocument()
+        doc.prepareUntitled(markdown: choice == .alertFirstButtonReturn)
+        NSDocumentController.shared.addDocument(doc)
+        doc.makeWindowControllers()
+        doc.showWindows()
+    }
+
     // MARK: - Become the default app for text files (user-initiated only)
 
-    /// The kinds this offer covers. Only types macOS actually has a registered identity for —
-    /// .conf/.env/.rst and friends resolve to a throwaway identity that no association can be
-    /// pinned to, so promising them here would be a promise the system can't keep.
-    private static let claimable: [(name: String, id: String)] = [
-        ("Plain text (.txt)", "public.plain-text"),
-        ("Comma-separated values (.csv)", "public.comma-separated-values-text"),
-        ("Tab-separated values (.tsv)", "public.tab-separated-values-text"),
-        ("Log files (.log)", "com.apple.log"),
-        ("Markdown (.md)", "net.daringfireball.markdown"),
+    /// The kinds this offer covers, and whether one is ticked to begin with. Only types macOS
+    /// actually has a registered identity for — .conf/.env/.rst and friends resolve to a throwaway
+    /// identity that no association can be pinned to, so promising them here would be a promise the
+    /// system can't keep.
+    ///
+    /// Markdown starts ticked because that is what this app is for. The text kinds start clear:
+    /// they are a capability, not the reason someone installed a Markdown reader, and quietly
+    /// taking over every .csv on someone's Mac is not a favour.
+    private static let claimable: [(name: String, id: String, onByDefault: Bool)] = [
+        ("Markdown  (.md, .markdown)", "net.daringfireball.markdown", true),
+        ("Plain text  (.txt)", "public.plain-text", false),
+        ("Comma-separated values  (.csv)", "public.comma-separated-values-text", false),
+        ("Tab-separated values  (.tsv)", "public.tab-separated-values-text", false),
+        ("Log files  (.log)", "com.apple.log", false),
     ]
 
     @objc func offerToBecomeDefault(_ sender: Any?) {
+        // A checkbox per kind, so the choice is the user's rather than a take-it-or-leave-it lump.
+        // A kind this app ALREADY handles is shown ticked and disabled: unticking couldn't undo it
+        // (macOS has no "no default app" — some other app has to claim it), and a control that
+        // looks like it undoes something but doesn't is worse than no control.
+        let rowHeight: CGFloat = 24
+        let box = NSView(frame: NSRect(x: 0, y: 0, width: 340,
+                                       height: rowHeight * CGFloat(Self.claimable.count)))
+        var boxes: [(NSButton, String)] = []
+        for (i, kind) in Self.claimable.enumerated() {
+            let already = isDefaultApp(for: kind.id)
+            let button = NSButton(checkboxWithTitle: already ? kind.name + "  — already set" : kind.name,
+                                  target: nil, action: nil)
+            button.state = (already || kind.onByDefault) ? .on : .off
+            button.isEnabled = !already
+            // Top-down reading order in a bottom-up coordinate system.
+            button.frame = NSRect(x: 0, y: CGFloat(Self.claimable.count - 1 - i) * rowHeight,
+                                  width: 340, height: rowHeight - 4)
+            box.addSubview(button)
+            if !already { boxes.append((button, kind.id)) }
+        }
+
         let alert = NSAlert()
-        alert.messageText = "Open these files with fast-md-reader?"
-        alert.informativeText = """
-            Double-clicking these kinds of file in the Finder will open them here:
-
-            \(Self.claimable.map { "•  " + $0.name }.joined(separator: "\n"))
-
-            This changes a system setting. To undo it, select a file in the Finder, press ⌘I, and \
-            pick another app under "Open with".
-            """
-        alert.addButton(withTitle: "Use fast-md-reader")
-        alert.addButton(withTitle: "Not Now")
+        alert.messageText = "Set fast-md-reader as the default app"
+        alert.informativeText = "Double-clicking a ticked kind of file in the Finder will open it here. "
+            + "To undo this later, select a file in the Finder, press ⌘I, and pick another app under “Open with”."
+        alert.accessoryView = box
+        alert.addButton(withTitle: "Set as Default")
+        alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
+        let chosen = boxes.filter { $0.0.state == .on }.map { $0.1 }
+        guard !chosen.isEmpty else { return }        // everything unticked = nothing to do
+        applyDefaults(for: chosen)
+    }
+
+    /// Whether this app is already what macOS opens the given kind with.
+    private func isDefaultApp(for identifier: String) -> Bool {
+        guard let type = UTType(identifier),
+              let current = NSWorkspace.shared.urlForApplication(toOpen: type) else { return false }
+        return current.standardizedFileURL == Bundle.main.bundleURL.standardizedFileURL
+    }
+
+    private func applyDefaults(for identifiers: [String]) {
         let appURL = Bundle.main.bundleURL
         let bundleID = Bundle.main.bundleIdentifier ?? ""
         // The completion handlers come back on whatever queue AppKit chooses, so the tally is
@@ -157,18 +227,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         var failures: [String] = []
         func note(_ name: String) { lock.lock(); failures.append(name); lock.unlock() }
         let group = DispatchGroup()
-        for kind in Self.claimable {
-            guard let type = UTType(kind.id) else { note(kind.name); continue }
+        for identifier in identifiers {
+            let name = Self.claimable.first { $0.id == identifier }?.name ?? identifier
+            guard let type = UTType(identifier) else { note(name); continue }
             group.enter()
             if #available(macOS 14.0, *) {
                 NSWorkspace.shared.setDefaultApplication(at: appURL, toOpen: type) { error in
-                    if error != nil { note(kind.name) }
+                    if error != nil { note(name) }
                     group.leave()
                 }
             } else {
                 let status = LSSetDefaultRoleHandlerForContentType(
-                    kind.id as CFString, .all, bundleID as CFString)
-                if status != noErr { note(kind.name) }
+                    identifier as CFString, .all, bundleID as CFString)
+                if status != noErr { note(name) }
                 group.leave()
             }
         }

@@ -1,11 +1,29 @@
 import AppKit
 
-final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTextViewDelegate {
+final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTextViewDelegate,
+                                     NSMenuItemValidation {
     // Explicit TextKit 1 stack (C2): building the view with init(frame:textContainer:)
     // guarantees the classic NSLayoutManager path instead of silently falling back
     // to TextKit 2 compatibility mode when layoutManager is later accessed.
     let textView: ReaderTextView
     private let scrollView = NSScrollView()
+    private let outline = OutlinePanel(frame: NSRect(x: 0, y: 0, width: OutlinePanel.defaultWidth, height: 400))
+    // A real NSSplitViewController with a `sidebar` item, not a hand-built NSSplitView. That is
+    // what makes the panel LOOK like a Mac sidebar — the inset rounded panel, the system material,
+    // the toolbar's ⌥⌘S toggle sitting beside the traffic lights, the divider that tracks it. Every
+    // one of those was a thing to imitate by hand and get subtly wrong.
+    private let splitVC = NSSplitViewController()
+    /// The standard indeterminate spinner, shown over the text while a relayout runs.
+    private let spinner: NSProgressIndicator = {
+        let p = NSProgressIndicator()
+        p.style = .spinning
+        p.isIndeterminate = true
+        p.controlSize = .regular
+        p.isDisplayedWhenStopped = false
+        p.isHidden = true
+        return p
+    }()
+    private var sidebarItem: NSSplitViewItem!
 
     convenience init() {
         let window = NSWindow(
@@ -55,7 +73,34 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
         // NSClipView repaints only the newly-exposed strip while scrolling, so custom card/quote
         // backgrounds can tear briefly mid-scroll. That's fine: viewportChanged repaints the whole
         // visible area ONCE when scrolling settles.
-        window.contentView = scrollView
+        // The table of contents sits beside the text as a system sidebar. Collapsed until asked
+        // for: a reader opens a document to read it, not to look at a list of its headings.
+        let sidebarVC = NSViewController()
+        sidebarVC.view = outline
+        sidebarItem = NSSplitViewItem(sidebarWithViewController: sidebarVC)
+        sidebarItem.minimumThickness = 180
+        sidebarItem.maximumThickness = 420
+        sidebarItem.canCollapse = true
+        sidebarItem.isCollapsed = true
+        let contentVC = NSViewController()
+        contentVC.view = scrollView
+        splitVC.addSplitViewItem(sidebarItem)
+        splitVC.addSplitViewItem(NSSplitViewItem(viewController: contentVC))
+        splitVC.splitView.autosaveName = "FastMDReaderSidebar"
+        outline.onSelect = { [weak self] charIndex in self?.goToOutlineEntry(charIndex) }
+        window.contentViewController = splitVC
+        // The sidebar button goes in a TITLEBAR ACCESSORY, not a toolbar. Measured, twice: this
+        // macOS lays toolbar items out trailing — with the title leading — so a toolbar button ends
+        // up on the far right however the identifiers are ordered, and `.flexibleSpace` doesn't
+        // move it. A `.leading` accessory is the documented way to put a control immediately right
+        // of the traffic lights, which is where every Mac app keeps this one.
+        let accessory = NSTitlebarAccessoryViewController()
+        accessory.layoutAttribute = .leading
+        accessory.view = sidebarButtonView()
+        window.addTitlebarAccessoryViewController(accessory)
+        // NOT fullSizeContentView / titlebarAppearsTransparent. Tried, and wrong: it runs the
+        // document up under the title bar so text scrolls through it. The title bar stays solid and
+        // opaque, which is what Preview does too — the sidebar is a panel below it, not behind it.
         window.delegate = self                     // windowDidResize → recompute the column
         updateTextInset()
 
@@ -75,12 +120,95 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
 
     deinit { NotificationCenter.default.removeObserver(self) }
 
-    // Re-render the centered column and re-place code overlays whenever the window resizes.
+    // The text column is recomputed when a resize ENDS, not on every frame of one. Re-wrapping a
+    // long document is a full relayout; doing it per frame is what makes a drag feel like it is
+    // fighting you. During the drag the column simply keeps its old width and the window moves
+    // around it — the same treatment the sidebar animation gets, and for the same reason.
+    /// The line at the top of the viewport when a resize began — restored after the reflow.
+    private var resizeAnchor = ReadingAnchor(char: 0, offsetFromTop: 0)
+
+    func windowWillStartLiveResize(_ notification: Notification) {
+        resizeAnchor = readingAnchor()
+        suspendReflow = true
+    }
+
+    func windowDidEndLiveResize(_ notification: Notification) {
+        lastClipWidth = scrollView.contentSize.width
+        // Restore the reading position by CHARACTER, not by scroll offset. A narrower column wraps
+        // the same text into more lines, so the document grows taller and the old offset lands
+        // somewhere else entirely — further from where you were the longer the document is.
+        reflow(keeping: resizeAnchor)
+    }
+
+    /// Re-wrap the document and put `anchor` back at the top, with the system spinner over it while
+    /// that happens. On a 1MB file the relayout takes long enough to look like the app has stopped
+    /// responding, and a spinner is the difference between "working" and "broken".
+    ///
+    /// The work runs on the NEXT run-loop turn: it blocks the main thread, so a spinner started and
+    /// stopped around it in one turn would never paint. And the spinner only appears if the work
+    /// outlasts a short delay — on a small document it finishes first and nothing flashes.
+    private func reflow(keeping anchor: ReadingAnchor) {
+        runBusy { [weak self] in
+            guard let self else { return }
+            self.suspendReflow = false
+            self.updateTextInset()
+            // Lay the WHOLE document out before scrolling. Narrowing the column wraps the text into
+            // more lines, so the document gets taller — but until that layout exists the text view's
+            // height is still the old, shorter one, and scrolling to the anchor gets clamped short
+            // of it. That is why the position held when widening and drifted when narrowing, and
+            // why opening the sidebar (narrower) drifted while closing it (wider) did not.
+            if let lm = self.textView.layoutManager, let tc = self.textView.textContainer {
+                lm.ensureLayout(for: tc)
+                self.textView.sizeToFit()
+            }
+            self.restore(anchor)
+            self.placeCopyButtons()
+        }
+    }
+
+    /// Run work that blocks the main thread, with the spinner over it if it takes long enough to
+    /// notice. Every path that re-lays out the whole document goes through here — resize, sidebar,
+    /// font size — so none of them can look like a freeze.
+    func runBusy(_ work: @escaping () -> Void) {
+        // Show it FIRST and force it to draw. A delayed show can never fire: the work blocks the
+        // main thread, so the timer only gets its turn after the work is already done and the
+        // spinner has been cancelled — which is exactly why no spinner ever appeared.
+        //
+        // Only for documents big enough for the relayout to be visible; below that the work is a
+        // few milliseconds and a spinner would be a flash of noise.
+        let heavy = (textView.textStorage?.length ?? 0) > 120_000
+        if heavy {
+            setBusy(true)
+            spinner.display()                     // paint it now, before the main thread is busy
+        }
+        DispatchQueue.main.async {
+            work()
+            if heavy { self.setBusy(false) }
+        }
+    }
+
+    func setBusy(_ busy: Bool) {
+        if busy {
+            spinner.frame = NSRect(x: (scrollView.bounds.width - 32) / 2,
+                                   y: (scrollView.bounds.height - 32) / 2, width: 32, height: 32)
+            if spinner.superview == nil { scrollView.addFloatingSubview(spinner, for: .vertical) }
+            spinner.isHidden = false
+            spinner.startAnimation(nil)
+        } else {
+            spinner.stopAnimation(nil)
+            spinner.isHidden = true
+        }
+    }
+
     func windowDidResize(_ notification: Notification) {
-        // Reflow immediately for a responsive resize; the overlay re-placement rides the debounced
-        // viewportChanged (frame/bounds change) — no need to also rebuild overlays on every step.
+        // Still runs for programmatic resizes (zoom, tiling, entering full screen), which arrive in
+        // one step and have no drag to be jerky — but reflow moves the text under the reader there
+        // too, so the same anchor applies.
+        guard !suspendReflow else { return }
+        let anchor = readingAnchor()
         lastClipWidth = scrollView.contentSize.width
         updateTextInset()
+        restore(anchor)
     }
 
     override init(window: NSWindow?) {
@@ -112,19 +240,118 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
     private let minSideInset: CGFloat = 32
     private let verticalInset: CGFloat = 28
 
+    /// Set while the sidebar animates: width changes are ignored until it settles (see the toggle).
+    private var suspendReflow = false
+
     private func updateTextInset() {
         let clipWidth = scrollView.contentSize.width
-        guard clipWidth > 1 else { return }
+        guard clipWidth > 1, !suspendReflow else { return }
         let column = max(200, clipWidth - 2 * minSideInset)   // fill the window minus margins
         textView.textContainerInset = NSSize(width: minSideInset, height: verticalInset)
         textView.textContainer?.containerSize = NSSize(width: column, height: CGFloat.greatestFiniteMagnitude)
         var f = textView.frame; f.size.width = clipWidth; textView.frame = f
     }
 
+    // MARK: - Table of contents (⌥⌘T)
+
+    private var isOutlineVisible = false
+
+    /// Toggle the sidebar. Off for a document with no headings — an empty panel taking a third of
+    /// the window teaches the reader that the feature is broken.
+    @objc func toggleTableOfContents(_ sender: Any?) {
+        guard let storage = textView.textStorage else { return }
+        outline.reload(from: storage)
+        guard !outline.entries.isEmpty || isOutlineVisible else { NSSound.beep(); return }
+        // Freeze the text column while the sidebar slides. Every animation frame changes the split
+        // view's width, and reflowing a long document at 60fps is what made the open/close feel
+        // heavy — the text is simply pushed across, then laid out ONCE when the animation lands.
+        let anchor = readingAnchor()
+        suspendReflow = true
+        splitVC.toggleSidebar(sender)
+        isOutlineVisible = !sidebarItem.isCollapsed
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            guard let self else { return }
+            self.reflow(keeping: anchor)          // the line you were reading stays put
+            self.reloadOutline()
+        }
+    }
+
+    /// Rebuild the sidebar's list from the current text. Called from BOTH render paths — a spliced
+    /// edit changes headings just as a full re-render does, and only the full one used to say so,
+    /// which is why adding a `##` or moving a section left the list stale.
+    func reloadOutline() {
+        guard let storage = textView.textStorage else { return }
+        outline.reload(from: storage)
+        if isOutlineVisible { outline.markCurrent(charIndex: textView.selectedRange().location) }
+    }
+
+    /// Clicking a heading in the sidebar moves the READING CURSOR there, not just the scroll
+    /// position. The cursor is where every block action starts from, so leaving it behind would
+    /// mean the sidebar takes you to a section that `E` or `J` then doesn't act on.
+    private func goToOutlineEntry(_ charIndex: Int) {
+        textView.setSelectedRange(NSRange(location: charIndex, length: 0))
+        scrollCharToTop(charIndex)
+        window?.makeFirstResponder(textView)
+    }
+
+    // MARK: Toolbar (the sidebar button)
+
+    private func sidebarButtonView() -> NSView {
+        let button = NSButton(image: NSImage(systemSymbolName: "sidebar.left",
+                                             accessibilityDescription: "Table of contents")!,
+                              target: self, action: #selector(toggleTableOfContents(_:)))
+        button.bezelStyle = .texturedRounded
+        button.isBordered = false
+        button.toolTip = "Show or hide the table of contents (T)"
+        button.translatesAutoresizingMaskIntoConstraints = false
+        // Centred by CONSTRAINT, not by a hand-picked frame: the title bar's height isn't ours to
+        // predict (it changes with the system and with tabs), and a guessed y sits a pixel or two
+        // off — which is precisely what it looked like.
+        let host = NSView(frame: NSRect(x: 0, y: 0, width: 44, height: 28))
+        host.addSubview(button)
+        NSLayoutConstraint.activate([
+            button.centerYAnchor.constraint(equalTo: host.centerYAnchor),
+            button.leadingAnchor.constraint(equalTo: host.leadingAnchor, constant: 6),
+            button.widthAnchor.constraint(equalToConstant: 32),
+            button.heightAnchor.constraint(equalToConstant: 22),
+        ])
+        return host
+    }
+
+    /// Grey the menu item out where a table of contents would be empty, rather than opening an empty
+    /// panel and leaving the reader to work out why.
+    func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        if item.action == #selector(toggleTableOfContents(_:)) {
+            item.title = isOutlineVisible ? "Hide Table of Contents" : "Table of Contents"
+            return canShowTableOfContents
+        }
+        return true
+    }
+
+    /// Enabled only where a table of contents means something: markdown, with headings in it.
+    var canShowTableOfContents: Bool {
+        guard let doc = document as? MarkdownDocument, !doc.isPlainText,
+              let storage = textView.textStorage else { return false }
+        var any = false
+        storage.enumerateAttribute(MDAttr.heading, in: NSRange(location: 0, length: storage.length)) { v, _, stop in
+            if v != nil { any = true; stop.pointee = true }
+        }
+        return any
+    }
+
+    /// Keep the sidebar's highlight on the section the CURSOR is in — not the one that happens to
+    /// be scrolled into view. The cursor is what the reader placed deliberately and what every
+    /// block action works from, so the two halves of the window agree about where "here" is.
+    func textViewDidChangeSelection(_ notification: Notification) {
+        guard isOutlineVisible else { return }
+        outline.markCurrent(charIndex: textView.selectedRange().location)
+    }
+
     func display(_ attributed: NSAttributedString) {
         updateTextInset()
         textView.textStorage?.setAttributedString(attributed)
         textView.recomputeHeadingOffsets()
+        reloadOutline()
         textView.resetCaret()
         window?.makeFirstResponder(textView)
         // Re-apply the column and place buttons after layout has established real sizes.
@@ -183,6 +410,65 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
         return lm.characterRange(forGlyphRange: gr, actualGlyphRange: nil)
     }
 
+    /// What the reader is looking at, as a character plus where on screen it sat. Restoring BOTH is
+    /// what makes a reflow invisible: keeping only the character would jump that line to the top of
+    /// the window, and keeping only the offset would land on different text once the wrapping
+    /// changed.
+    struct ReadingAnchor {
+        let char: Int
+        /// Distance from the top of the viewport to that line, in points.
+        let offsetFromTop: CGFloat
+    }
+
+    /// The cursor if it is on screen, otherwise whatever sits at the middle of the viewport.
+    ///
+    /// The cursor wins because it is the one place the reader put deliberately — it is where every
+    /// block action happens, and watching it slide away while the window resizes is the thing that
+    /// feels wrong. With no cursor in sight the centre of the page is the honest stand-in: anchoring
+    /// on the top line lets everything below it drift, which is most of what you are reading.
+    func readingAnchor() -> ReadingAnchor {
+        guard let lm = textView.layoutManager, let tc = textView.textContainer,
+              let storage = textView.textStorage, storage.length > 0, lm.numberOfGlyphs > 0 else {
+            return ReadingAnchor(char: 0, offsetFromTop: 0)
+        }
+        let visible = textView.visibleRect
+        let inset = textView.textContainerInset
+        func lineTop(_ char: Int) -> CGFloat {
+            let glyph = min(lm.glyphIndexForCharacter(at: char), lm.numberOfGlyphs - 1)
+            return lm.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil).minY + inset.height
+        }
+        // Two cases, two meanings. The CURSOR is an exact spot the reader put there, so it anchors
+        // on its own line and comes back to the same height. With no cursor in view there is no such
+        // spot: take whatever character sits dead centre of the page and put it back dead centre.
+        // Centre is the right target because a reflow changes how much fits above and below — hold
+        // the middle and the drift is split evenly instead of piling up on one side.
+        let caret = min(textView.selectedRange().location, storage.length - 1)
+        let caretTop = lineTop(caret)
+        if caretTop >= visible.minY, caretTop <= visible.maxY {
+            return ReadingAnchor(char: caret, offsetFromTop: caretTop - visible.minY)
+        }
+        let centrePoint = NSPoint(x: tc.size.width / 2, y: visible.midY - inset.height)
+        let centre = min(lm.characterIndexForGlyph(at: lm.glyphIndex(for: centrePoint, in: tc)),
+                         storage.length - 1)
+        return ReadingAnchor(char: centre, offsetFromTop: visible.height / 2)
+    }
+
+    /// Put an anchor back where it was on screen.
+    func restore(_ anchor: ReadingAnchor) {
+        guard let lm = textView.layoutManager, let storage = textView.textStorage,
+              lm.numberOfGlyphs > 0 else { return }
+        let char = min(max(0, anchor.char), max(0, storage.length - 1))
+        let glyph = min(lm.glyphIndexForCharacter(at: char), lm.numberOfGlyphs - 1)
+        let lineTop = lm.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil).minY
+            + textView.textContainerInset.height
+        var y = lineTop - anchor.offsetFromTop
+        if y <= textView.textContainerInset.height { y = 0 }   // keep the page's top margin
+        let clip = scrollView.contentView
+        let maxY = max(0, textView.bounds.height - clip.bounds.height)
+        clip.scroll(to: NSPoint(x: 0, y: min(max(0, y), maxY)))
+        scrollView.reflectScrolledClipView(clip)
+    }
+
     /// The character index currently at the top of the visible area.
     func topVisibleCharIndex() -> Int {
         guard let lm = textView.layoutManager, let tc = textView.textContainer,
@@ -202,7 +488,11 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
         let glyph = lm.glyphIndexForCharacter(at: idx)
         var rect = lm.lineFragmentRect(forGlyphAt: min(glyph, lm.numberOfGlyphs - 1), effectiveRange: nil)
         rect.origin.y += textView.textContainerInset.height
-        let targetY = rect.origin.y - CGFloat(lineOffset) * rect.height
+        var targetY = rect.origin.y - CGFloat(lineOffset) * rect.height
+        // The first line is a special case: putting it flush with the top edge scrolls the page's
+        // top margin out of sight, so the document looks like it lost its padding. Nothing above it
+        // needs the room, so go to the very top instead.
+        if targetY <= textView.textContainerInset.height { targetY = 0 }
         let clip = scrollView.contentView
         let maxY = max(0, textView.bounds.height - clip.bounds.height)
         clip.scroll(to: NSPoint(x: 0, y: min(max(0, targetY), maxY)))
@@ -268,9 +558,6 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
     }
 
     func placeCopyButtons() {
-        // The move bar tracks a block, not a code block, so it must be repositioned even when the
-        // signature check below short-circuits the overlay rebuild.
-        defer { positionMoveBar() }
         guard let storage = textView.textStorage,
               let lm = textView.layoutManager,
               let container = textView.textContainer, storage.length > 0 else {
@@ -601,7 +888,10 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
     /// Right-click → Edit: open the markdown SOURCE of the block(s) the selection touches in a
     /// popup; on save, replace just that source span and re-render (Notion-style block editing).
     func editSelectedSource(atChar: Int? = nil) {
-        guard let storage = textView.textStorage, let doc = document as? MarkdownDocument, storage.length > 0 else { return }
+        guard let storage = textView.textStorage, let doc = document as? MarkdownDocument else { return }
+        // Nothing to edit yet — treat Edit on an empty document as writing its first block, rather
+        // than beeping at someone who is trying to start.
+        guard storage.length > 0 else { addBlockBelow(atChar: nil); return }
         let sel = textView.selectedRange()
         // Use the selection if there is one; otherwise the block under the right-click (or caret).
         let anchor = (atChar ?? sel.location)
@@ -641,6 +931,18 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
     /// clicked block, reusing that document's own separator (blank line in markdown, single
     /// newline in a plain text file).
     func addBlockBelow(atChar char: Int?) {
+        // An EMPTY document has no blocks to add below, and without this it had no way in at all:
+        // every editing route resolves a block first, so a new tab was a document you could never
+        // put anything into. Here the first block simply becomes the document.
+        if blockContext(atChar: char) == nil {
+            guard let doc = document as? MarkdownDocument else { NSSound.beep(); return }
+            SourceEditPanel.show(title: doc.isPlainText ? "New line" : "New block", markdown: "") { added in
+                guard !added.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+                let whole = NSRange(location: 0, length: (doc.text as NSString).length)
+                doc.applySourceEdit(whole, with: added, actionName: "Add")
+            }
+            return
+        }
         guard let ctx = blockContext(atChar: char) else { NSSound.beep(); return }
         // A text file gets exactly one new line; a markdown file keeps its own paragraph spacing.
         let fixed = ctx.doc.isPlainText ? ctx.doc.lineEnding : nil
@@ -753,99 +1055,64 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
         placeCopyButtons()
     }
 
-    // MARK: Move mode
-
-    private var moveBar: BlockMoveBar?
-    private var moveIndex: Int?
-
-    /// Right-click → Move Block: enter move mode. The block is selected (so it is visibly the one
-    /// travelling) and a small ▲▼ bar appears beside it; ↑/↓ do the same thing from the keyboard,
-    /// ↵/esc leave. Each press is one `applySourceEdit`, so every step is separately undoable.
-    func beginMovingBlock(atChar char: Int?) {
-        guard let ctx = blockContext(atChar: char) else { NSSound.beep(); return }
-        endMovingBlock()
-        moveIndex = ctx.index
-        let bar = BlockMoveBar()
-        bar.onUp = { [weak self] in self?.moveBlock(by: -1) }
-        bar.onDown = { [weak self] in self?.moveBlock(by: 1) }
-        bar.onDone = { [weak self] in self?.endMovingBlock() }
-        moveBar = bar
-        textView.addSubview(bar)
-        textView.isMovingBlock = true
-        selectMovingBlock()
-        positionMoveBar()
-    }
-
-    func endMovingBlock() {
-        moveBar?.removeFromSuperview()
-        moveBar = nil
-        moveIndex = nil
-        textView.isMovingBlock = false
-    }
-
-    var isMovingBlock: Bool { moveIndex != nil }
-
-    /// Move the block one step. Moving up is "swap the block above with me", which is the same
-    /// operation as moving that block down — one primitive covers both directions.
-    func moveBlock(by delta: Int) {
-        guard let i = moveIndex, let storage = textView.textStorage,
-              let doc = document as? MarkdownDocument else { return }
+    /// Move the block under the reading cursor one step, without entering move mode — the `u`/`j`
+    /// keys.
+    ///
+    /// Selecting ONLY the block that moved is what makes repeated presses work, not just tidier
+    /// highlighting. A swap edits two blocks, so the generic post-edit reveal selects both and
+    /// leaves the cursor at the start — which for a downward move is the OTHER block, so the next
+    /// press picks that one up and swaps the pair straight back. (`u` appeared fine only because
+    /// there the moved block happens to end up first.) Landing the cursor on the moved block walks
+    /// it as far as you keep pressing.
+    func moveBlockUnderCaret(by delta: Int) {
+        guard let storage = textView.textStorage, let doc = document as? MarkdownDocument,
+              let ctx = blockContext(atChar: textView.selectedRange().location) else { NSSound.beep(); return }
         let spans = BlockEdit.spans(in: storage)
-        let first = delta < 0 ? i - 1 : i
+        let first = delta < 0 ? ctx.index - 1 : ctx.index
         guard let (r, replacement) = BlockEdit.swapWithNext(first, spans: spans, text: doc.text as NSString)
-        else { NSSound.beep(); return }
-        doc.applySourceEdit(r, with: replacement, actionName: "Move Block")
-        moveIndex = i + delta
-        selectMovingBlock()
-        revealMovingBlock()
-        positionMoveBar()
+        else { NSSound.beep(); return }              // already at the end it's moving toward
+        doc.applySourceEdit(r, with: replacement, actionName: "Move")
+        selectBlock(at: ctx.index + delta)
     }
 
-    /// Highlight the travelling block by selecting its rendered range — no new drawing code, and
-    /// it reads as a selection because that is exactly what it is.
-    private func selectMovingBlock() {
-        guard let r = movingBlockRenderedRange() else { return }
+    /// Select one block by index and bring it on screen if it isn't already.
+    @discardableResult
+    func selectBlock(at index: Int) -> Bool {
+        guard let storage = textView.textStorage,
+              let r = renderedRange(ofBlockAt: index, in: storage) else { return false }
         textView.setSelectedRange(r)
+        revealIfOffscreen(r)
+        placeCopyButtons()
+        return true
     }
 
-    private func revealMovingBlock() {
-        guard let r = movingBlockRenderedRange() else { return }
-        textView.scrollRangeToVisible(r)
-    }
-
-    /// The rendered (on-screen) range of the block currently being moved. `spans` is passed in when
-    /// the caller already has it — scanning a 1MB document for block spans costs milliseconds, and
-    /// this runs on every scroll event while the move bar is up, so doing it twice is twice too many.
-    private func movingBlockRenderedRange(spans precomputed: [NSRange]? = nil) -> NSRange? {
-        guard let i = moveIndex, let storage = textView.textStorage else { return nil }
+    /// The rendered range of the block at `index` — the one place that answers "where on screen is
+    /// this block?", so the post-edit reveal and the key moves can't drift apart.
+    private func renderedRange(ofBlockAt index: Int, in storage: NSTextStorage,
+                               spans precomputed: [NSRange]? = nil) -> NSRange? {
         let spans = precomputed ?? BlockEdit.spans(in: storage)
-        guard spans.indices.contains(i) else { return nil }
-        let target = spans[i]
+        guard spans.indices.contains(index) else { return nil }
+        let target = spans[index]
         var lo = Int.max, hi = Int.min
         storage.enumerateAttribute(MDAttr.srcRange, in: NSRange(location: 0, length: storage.length)) { v, r, _ in
-            guard let s = (v as? NSValue)?.rangeValue, s.location == target.location else { return }
+            guard let s = (v as? NSValue)?.rangeValue, s.location == target.location, s.length == target.length
+            else { return }
             lo = min(lo, r.location); hi = max(hi, r.location + r.length)
         }
         guard lo != Int.max, hi > lo else { return nil }
         return NSRange(location: lo, length: hi - lo)
     }
 
-    /// Keep the bar glued to the right edge of its block through scrolling, resizing and moves.
-    /// Called from `placeCopyButtons`, which already runs on every scroll/resize/render.
-    func positionMoveBar() {
-        guard let bar = moveBar, let i = moveIndex, let storage = textView.textStorage,
-              let lm = textView.layoutManager, let container = textView.textContainer else { return }
-        let spans = BlockEdit.spans(in: storage)
-        guard let rendered = movingBlockRenderedRange(spans: spans) else { endMovingBlock(); return }
-        if bar.superview !== textView { textView.addSubview(bar) }   // survives a re-render
-        bar.setEnabled(up: i > 0, down: i + 1 < spans.count)
-        let glyphs = lm.glyphRange(forCharacterRange: rendered, actualCharacterRange: nil)
+    /// Scroll a range into view ONLY if it isn't fully visible — moving a block you're looking at
+    /// shouldn't shift the page under you.
+    private func revealIfOffscreen(_ r: NSRange) {
+        guard let lm = textView.layoutManager, let container = textView.textContainer else { return }
+        let glyphs = lm.glyphRange(forCharacterRange: r, actualCharacterRange: nil)
         var rect = lm.boundingRect(forGlyphRange: glyphs, in: container)
         rect.origin.x += textView.textContainerInset.width
         rect.origin.y += textView.textContainerInset.height
-        let size = BlockMoveBar.barSize
-        let x = min(max(4, rect.maxX + 8), textView.bounds.width - size.width - 4)
-        bar.setFrameOrigin(NSPoint(x: x, y: rect.minY))
+        guard !textView.visibleRect.contains(rect) else { return }
+        textView.scrollRangeToVisible(r)
     }
 
     func openSelectionText(_ raw: String) {
@@ -1009,12 +1276,17 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
         row("⌘-Click selection", "Open the selected text as a link / path / file")
         row("Click left margin", "Copy that whole block (or section, beside a heading)")
         row("Right-click selection", "Copy · Open · Edit… (edit that block's markdown source)")
-        row("Right-click a block", "Block ▸ Edit… · Add Below… · Move… · Delete… (asks first)")
-        row("While moving a block", "↑ / ↓ move it · ↵ or esc finish · ⌘Z undoes each step")
+        row("E · I · D", "Edit · Insert below · Delete — the block at the reading cursor")
+        row("U · J", "Move that block up · down (⌘Z undoes each step)")
+        row("Right-click a block", "The same four, on the block under the pointer")
+        row("⌘S", "Save — edits stay in memory until you do")
+        row("T", "Table of contents (Markdown with headings) — click a heading to jump")
+        row("⌘N", "New file — asks for Markdown or plain text")
         row("Click a diagram / formula / image", "Open it enlarged in a zoomable window")
         row("Wrap / Copy button", "Toggle a code block's wrapping / copy its code")
         section("Diagram window")
-        row("Pinch  or  + / −", "Zoom in / out");  row("0", "Fit to window");  row("Drag", "Move around (pan)")
+        row("Pinch  or  ⌘+ / ⌘−", "Zoom in / out");  row("⌘0", "Fit to window")
+        row("Drag", "Move around (pan)");  row("esc", "Close the zoom window")
         section("Help")
         row("?", "Show this guide")
         return out

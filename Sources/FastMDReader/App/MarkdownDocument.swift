@@ -216,6 +216,11 @@ final class MarkdownDocument: NSDocument {
 
         renderGeneration += 1
         wc.refreshAfterMutation()
+        // An edit can add, remove or rename a heading — `## New section` typed into a block, a
+        // section moved, a heading deleted — so the table of contents is as much a product of this
+        // path as the text is. Only the full re-render used to rebuild it, which is why the sidebar
+        // quietly described the document as it was several edits ago.
+        wc.reloadOutline()
         // Media inside the new fragment still needs its exact area reserved before it can draw —
         // same rule as a full render (invariant: size first, pixels later).
         DispatchQueue.main.async { [weak self, weak wc] in
@@ -288,11 +293,16 @@ final class MarkdownDocument: NSDocument {
 
     private func reRenderPreservingCaret() {
         guard let wc = windowControllers.first as? DocumentWindowController else { return }
-        let anchor = wc.topVisibleCharIndex()      // keep the top visible line stable across zoom
+        let anchor = wc.readingAnchor()            // cursor if visible, else the middle of the page
         let savedCaret = wc.textView.readingCaret
-        render(into: wc)                            // resets caret to 0 and re-lays out at the new size
-        wc.textView.readingCaret = savedCaret       // restore reading position (clamped internally)
-        wc.scrollCharToTop(anchor)                  // top anchor wins over the caret scroll
+        // A font-size change re-renders and re-lays out EVERYTHING, media included — the slowest
+        // thing the app does on a long document, so it gets the spinner like the other reflows.
+        wc.runBusy { [weak self, weak wc] in
+            guard let self, let wc else { return }
+            self.render(into: wc)                   // resets caret to 0 and re-lays out at the new size
+            wc.textView.readingCaret = savedCaret   // restore reading position (clamped internally)
+            wc.restore(anchor)                      // and put the page back where the eye was
+        }
     }
 
     /// True for a file this app opens as TEXT rather than markdown (.txt, .csv, .log, …). Decided
@@ -300,8 +310,35 @@ final class MarkdownDocument: NSDocument {
     /// those characters on the page, and guessing otherwise would rewrite what they see.
     /// Markdown extensions are the allowlist; everything else that reaches us is plain.
     var isPlainText: Bool {
-        let ext = (fileURL?.pathExtension ?? "md").lowercased()
+        let ext = (fileURL?.pathExtension ?? untitledExtension ?? "md").lowercased()
         return !["md", "markdown", "mdown", "mkd", "mdtext"].contains(ext) && !ext.isEmpty
+    }
+
+    /// What a NEW document is, before it has a file to be judged by. Nil for anything read from
+    /// disk, where the path answers the question.
+    private var untitledExtension: String?
+
+    override var displayName: String! {
+        get { fileURL == nil ? "Untitled.\(untitledExtension ?? "md")" : super.displayName }
+        set { super.displayName = newValue }
+    }
+
+    /// A brand-new, unsaved document of the chosen kind.
+    ///
+    /// Markdown starts with a skeleton rather than a blank page: this app edits a block at a time,
+    /// and a document with no blocks gives the reader nothing to click, edit, or move — the first
+    /// thing they'd meet is the one dead end the app has. Three blocks is enough to show what a
+    /// block IS. Plain text starts empty, because there a block is just a line and the first `i`
+    /// makes one.
+    func prepareUntitled(markdown: Bool) {
+        untitledExtension = markdown ? "md" : "txt"
+        fileType = markdown ? "net.daringfireball.markdown" : "public.plain-text"
+        let skeleton = markdown ? "# Title\n\nWrite here.\n\n## Section\n" : ""
+        self.text = skeleton
+        self.file = TextFile(text: skeleton, encoding: .utf8, hasBOM: false)
+        // Dirty from the start: there IS content and it exists nowhere but memory, so closing must
+        // ask rather than discard it silently.
+        if !skeleton.isEmpty { updateChangeCount(.changeDone) }
     }
 
     /// The line ending this file uses, so an inserted line matches the ones around it. A file made
@@ -419,7 +456,22 @@ final class MarkdownDocument: NSDocument {
             let s = targetW / size.width
             size = NSSize(width: targetW.rounded(), height: (size.height * s).rounded())
         }
-        return size
+        // Media grows and shrinks with the reader's text. A formula must: an `x` in a sentence and
+        // the same `x` in the equation beside it have to stay the same size, or the maths shrinks
+        // away as the prose grows. Pictures follow for a plainer reason — someone enlarging the text
+        // is asking to see MORE, and a diagram that stayed put while the words around it doubled
+        // would look like a mistake. All three are vector or downscaled, so nothing loses sharpness.
+        let scale = FontSizeStore.size / FontSizeStore.defaultSize
+        if scale != 1 {
+            size = NSSize(width: size.width * scale, height: size.height * scale)
+        }
+        // The column is the hard limit whatever the zoom — text never scrolls sideways here, and
+        // media that outgrew the page would be the one thing that did.
+        if size.width > colW {
+            let s = colW / size.width
+            size = NSSize(width: colW, height: size.height * s)
+        }
+        return NSSize(width: size.width.rounded(), height: size.height.rounded())
     }
 
     /// Reserve the exact column-fitted area for media whose size is known WITHOUT rendering: local

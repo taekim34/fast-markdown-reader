@@ -1,11 +1,34 @@
 import AppKit
 
-/// A scroll view that zooms with + / − / 0 (0 = fit) on top of the native trackpad pinch, and
-/// pans by click-drag (grab-hand) so you can move around a zoomed-in diagram.
+/// A scroll view that zooms with ⌘+ / ⌘− / ⌘0 (0 = fit) — and the same keys bare — on top of the
+/// native trackpad pinch, and pans by click-drag (grab-hand) so you can move around a zoomed-in
+/// diagram.
 final class ZoomScrollView: NSScrollView {
     override var acceptsFirstResponder: Bool { true }
 
+    /// `keyDown` only runs when this view is the first responder, which it is not reliably: the
+    /// image view or the window can hold it, and then the bare keys silently do nothing (they did).
+    /// A key equivalent is offered to the whole view tree regardless of who is first responder, so
+    /// the ⌘ forms always land — and they take precedence over the menu bar's ⌘+/⌘−/⌘0, which
+    /// resize the READER's text and mean nothing in front of a diagram.
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        guard event.modifierFlags.intersection([.command, .option, .control]) == [.command],
+              let key = event.charactersIgnoringModifiers else {
+            return super.performKeyEquivalent(with: event)
+        }
+        switch key {
+        case "+", "=": zoom(by: 1.25); return true
+        case "-", "_": zoom(by: 1 / 1.25); return true
+        case "0":      fit(); return true
+        default:       return super.performKeyEquivalent(with: event)
+        }
+    }
+
     override func keyDown(with event: NSEvent) {
+        // Esc by KEY CODE, closed here rather than left to `cancelOperation`. That callback only
+        // arrives via `interpretKeyEvents`, which a plain NSView never calls (it is NSTextView and
+        // NSControl behaviour) — so the tidy-looking route silently never fired.
+        if event.keyCode == 53 { window?.performClose(nil); return }
         switch event.charactersIgnoringModifiers {
         case "+", "=": zoom(by: 1.25)
         case "-", "_": zoom(by: 1 / 1.25)
@@ -45,6 +68,17 @@ final class ZoomScrollView: NSScrollView {
     }
 
     override func mouseUp(with event: NSEvent) { NSCursor.openHand.set() }
+}
+
+/// The zoom window itself closes on Esc. A window receives `keyDown` only for keys nothing in its
+/// responder chain took, which makes it the one place the key can't be missed — the scroll view's
+/// own handler works only while it happens to be first responder, and that is not guaranteed (it is
+/// why the zoom keys appeared dead before they were moved to a key equivalent).
+final class ZoomWindow: NSWindow {
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 53 { performClose(nil); return }   // esc
+        super.keyDown(with: event)
+    }
 }
 
 /// Centers the document view when it is smaller than the viewport (a wide/short diagram would
@@ -93,10 +127,10 @@ final class DiagramZoomWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private convenience init(image: NSImage) {
-        let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1000, height: 760),
-                           styleMask: [.titled, .closable, .resizable, .miniaturizable],
-                           backing: .buffered, defer: false)
-        win.title = "Zoom — pinch/+/− · drag to move · 0 to fit"
+        let win = ZoomWindow(contentRect: NSRect(x: 0, y: 0, width: 1000, height: 760),
+                             styleMask: [.titled, .closable, .resizable, .miniaturizable],
+                             backing: .buffered, defer: false)
+        win.title = "Zoom — ⌘+ / ⌘− or pinch · ⌘0 to fit · drag to move · esc to close"
         win.isReleasedWhenClosed = false
         self.init(window: win)
         win.delegate = self

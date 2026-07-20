@@ -21,13 +21,14 @@ final class SourceEditPanel: NSWindowController, NSWindowDelegate {
         self.onSave = onSave
         let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 420),
                            styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
-        win.title = "\(title)  —  ⌘↵ save · esc cancel"
+        win.title = "\(title)  —  ⌘S or ⌘↵ save · esc cancel"
         win.isReleasedWhenClosed = false
         super.init(window: win)
         win.delegate = self
         win.center()
 
-        let content = NSView(frame: NSRect(x: 0, y: 0, width: 640, height: 420))
+        let content = KeyCatchView(frame: NSRect(x: 0, y: 0, width: 640, height: 420))
+        content.onSave = { [weak self] in self?.saveTapped() }
 
         let scroll = NSScrollView(frame: NSRect(x: 0, y: 48, width: 640, height: 372))
         scroll.autoresizingMask = [.width, .height]
@@ -82,6 +83,24 @@ final class SourceEditPanel: NSWindowController, NSWindowDelegate {
     /// "undo my last saved edit" in the document, which is what each window makes the user expect.
     @objc func undoSourceEdit(_ sender: Any?) { editor.undoManager?.undo() }
     @objc func redoSourceEdit(_ sender: Any?) { editor.undoManager?.redo() }
+}
+
+/// Catches ⌘S inside the edit popup. The Save button already owns ⌘↵, but ⌘S is what a hand reaches
+/// for after a lifetime of it — and here it must mean "commit this block", not the document-level
+/// Save in the menu bar, which would fire while a half-finished edit sits unapplied in this window.
+/// A key equivalent is offered to the whole view tree before the menu bar sees it, so catching it
+/// here takes precedence for exactly as long as this window is key.
+private final class KeyCatchView: NSView {
+    var onSave: () -> Void = {}
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if event.modifierFlags.intersection([.command, .option, .control, .shift]) == [.command],
+           event.charactersIgnoringModifiers?.lowercased() == "s" {
+            onSave()
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
 }
 
 extension SourceEditPanel: NSMenuItemValidation {

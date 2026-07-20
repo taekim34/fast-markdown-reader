@@ -106,12 +106,21 @@ final class ReaderTextView: NSTextView {
             (window?.windowController as? DocumentWindowController)?.showShortcutGuide(nil)
             return
         }
-        // Move mode owns the arrows while it is on: ↑/↓ move the block, ↵/esc leave.
-        if isMovingBlock, let wc = window?.windowController as? DocumentWindowController {
-            switch event.keyCode {
-            case 126: wc.moveBlock(by: -1); return          // ↑
-            case 125: wc.moveBlock(by: 1);  return          // ↓
-            case 36, 76, 53: wc.endMovingBlock(); return    // ↵ / ⌤ / esc
+        // Single-letter block actions on the block under the READING CURSOR. Plain letters are free
+        // here because the view accepts no typing (`shouldChangeTextIn` rejects everything), which
+        // is the same reason "?" opens the guide — and it keeps the common edits one key away
+        // instead of a right-click and a menu.
+        if event.modifierFlags.intersection([.command, .option, .control]).isEmpty,
+           let wc = window?.windowController as? DocumentWindowController,
+           let key = event.charactersIgnoringModifiers?.lowercased(), key.count == 1 {
+            let caret = selectedRange().location
+            switch key {
+            case "e": wc.editSelectedSource(atChar: caret); return
+            case "i": wc.addBlockBelow(atChar: caret); return
+            case "d": wc.deleteBlock(atChar: caret); return
+            case "u": wc.moveBlockUnderCaret(by: -1); return
+            case "j": wc.moveBlockUnderCaret(by: 1); return
+            case "t": wc.toggleTableOfContents(nil); return
             default: break
             }
         }
@@ -264,10 +273,14 @@ final class ReaderTextView: NSTextView {
         // earns its safety from the confirmation, not from being set apart. All four work without
         // a selection — each grabs the block under the pointer.
         addSectionHeader(unitNoun + " Actions", to: menu)
-        add("Edit…", symbol: "square.and.pencil", action: #selector(editSelectionMenu(_:)), to: menu)
-        add("Add Below…", symbol: "plus.square", action: #selector(addBlockMenu(_:)), to: menu)
-        add("Move…", symbol: "arrow.up.arrow.down", action: #selector(moveBlockMenu(_:)), to: menu)
-        add("Delete…", symbol: "trash", action: #selector(deleteBlockMenu(_:)), to: menu)
+        // The single-letter keys are shown here because a shortcut nobody can see is a shortcut
+        // nobody uses. They apply to the block under the reading cursor; the menu applies to the
+        // block under the pointer — the same action either way.
+        add("Edit…", symbol: "square.and.pencil", action: #selector(editSelectionMenu(_:)), to: menu, key: "e")
+        add("Add Below…", symbol: "plus.square", action: #selector(addBlockMenu(_:)), to: menu, key: "i")
+        add("Move Up", symbol: "arrow.up", action: #selector(moveUpMenu(_:)), to: menu, key: "u")
+        add("Move Down", symbol: "arrow.down", action: #selector(moveDownMenu(_:)), to: menu, key: "j")
+        add("Delete…", symbol: "trash", action: #selector(deleteBlockMenu(_:)), to: menu, key: "d")
         menu.addItem(.separator())
         addSectionHeader("Document", to: menu)
         add("Select All", symbol: "square.dashed", action: #selector(selectAll(_:)), to: menu)
@@ -285,8 +298,12 @@ final class ReaderTextView: NSTextView {
 
     /// One menu item with its icon. Every action here — ours and NSTextView's own `copy:` /
     /// `selectAll:` — is implemented by this view, so `self` is the right target for all of them.
-    private func add(_ title: String, symbol: String, action: Selector, to menu: NSMenu) {
-        let item = menu.addItem(withTitle: title, action: action, keyEquivalent: "")
+    private func add(_ title: String, symbol: String, action: Selector, to menu: NSMenu,
+                     key: String = "") {
+        let item = menu.addItem(withTitle: title, action: action, keyEquivalent: key)
+        // No modifier: these are bare letters handled in keyDown, and the menu is only showing what
+        // they are. A modifier mask here would print "⌘E" and teach the wrong shortcut.
+        item.keyEquivalentModifierMask = []
         item.target = self
         // A missing symbol name would silently leave ONE item unaligned — the exact raggedness this
         // is here to fix — so fall back to a blank image of the same size to hold the column.
@@ -344,14 +361,17 @@ final class ReaderTextView: NSTextView {
         (window?.windowController as? DocumentWindowController)?.deleteBlock(atChar: menuClickChar)
     }
 
-    @objc private func moveBlockMenu(_ sender: Any?) {
-        (window?.windowController as? DocumentWindowController)?.beginMovingBlock(atChar: menuClickChar)
+    /// The menu acts on the block under the POINTER, so put the cursor there first — otherwise
+    /// right-clicking one block and choosing Move Up would move whichever block the cursor was on.
+    @objc private func moveUpMenu(_ sender: Any?) { moveFromMenu(by: -1) }
+    @objc private func moveDownMenu(_ sender: Any?) { moveFromMenu(by: 1) }
+
+    private func moveFromMenu(by delta: Int) {
+        guard let wc = window?.windowController as? DocumentWindowController else { return }
+        if let c = menuClickChar { setSelectedRange(NSRange(location: c, length: 0)) }
+        wc.moveBlockUnderCaret(by: delta)
     }
 
-    /// Set while a block is being moved. The reading cursor's own arrow handling is suspended for
-    /// the duration, so ↑/↓ move the BLOCK — pressing an arrow and having the caret wander off
-    /// instead would silently break the mode the user just entered.
-    var isMovingBlock = false
 
     // MARK: - Left gutter: click a block's left margin to copy the whole unit
 
