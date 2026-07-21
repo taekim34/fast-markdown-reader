@@ -7,7 +7,13 @@ import AppKit
 /// edit work here for free once a later sprint wires this into the document — see invariant 1's
 /// sibling rule for images: a reserved layout size must never depend on whether pixels are loaded.
 enum OfficeTextBuilder {
-    static func build(_ blocks: [OfficeBlock], theme: RenderTheme) -> NSAttributedString {
+    /// `columnWidth` is the text column's width in points at build time (what `presizeKnownMedia`
+    /// calls `maxWidth` for markdown) — defaulted huge so callers that don't care about wrapping
+    /// (every test but the scaling one) get the declared size back untouched. A real caller
+    /// (`MarkdownDocument.render(into:)`) always passes the reader's actual column width: office
+    /// image sizing is decided HERE, once, at build time — never at load time (see `appendImage`).
+    static func build(_ blocks: [OfficeBlock], theme: RenderTheme,
+                      columnWidth: CGFloat = .greatestFiniteMagnitude) -> NSAttributedString {
         let result = NSMutableAttributedString()
         var blockSeq = 0
         // Ordered-list numbering state, keyed by nesting level. Lives for the whole build() call
@@ -51,7 +57,7 @@ enum OfficeTextBuilder {
                 appendTable(rows, headerRows: headerRows, into: result, theme: theme)
 
             case let .image(id, size):
-                appendImage(id: id, size: size, into: result)
+                appendImage(id: id, size: size, columnWidth: columnWidth, into: result)
             }
             tagBlock(from: start)
         }
@@ -189,62 +195,54 @@ enum OfficeTextBuilder {
 
     // MARK: Tables
 
-    /// A tab-stop grid, not a real bordered table (`NSTextTable`, which `MarkdownRenderer` uses) —
-    /// `OfficeBlock` doesn't carry per-cell borders/merges, and a hand-rolled grid is enough to
-    /// read as a table: `Palette.tableHeaderBg` shades the leading `headerRows` rows, and
-    /// `Palette.tableBorder` underlines the LAST of them (the header/body boundary) — `headerRows:
-    /// 0` means none of that: every row renders as ordinary content, because the source didn't say
-    /// any row was a header (see `OfficeBlock.table`; guessing "row one" would misrepresent a
-    /// headerless table). A cell always gets its tab even when empty, so an empty cell leaves its
-    /// column in place instead of collapsing the row.
+    /// Real bordered grid via the shared `TableBlockBuilder` (also used by `MarkdownRenderer`'s
+    /// GFM tables) — an office table now looks and behaves exactly like a markdown one, not a
+    /// tab-stop approximation. `headerRows: 0` shades no row, because the source didn't say any
+    /// row was a header (see `OfficeBlock.table`; guessing "row one" would misrepresent a
+    /// headerless table). A cell shorter than the widest row leaves its trailing columns empty
+    /// rather than collapsing the row.
     private static func appendTable(_ rows: [[[Span]]], headerRows: Int, into result: NSMutableAttributedString,
                                     theme: RenderTheme) {
-        let ncol = rows.map(\.count).max() ?? 0
-        guard ncol > 0 else {
+        guard (rows.map(\.count).max() ?? 0) > 0 else {
             result.append(NSAttributedString(string: "\n"))
             return
         }
-        let colWidth = theme.baseFontSize * 6
-        let tabStops = (1...ncol).map { NSTextTab(textAlignment: .left, location: CGFloat($0) * colWidth) }
         let headerFont = fontAdding(.bold, to: theme.bodyFont)
-        let lineHeight = (theme.baseFontSize * 1.4).rounded()
-
-        for (r, row) in rows.enumerated() {
+        let cellRows: [[NSAttributedString]] = rows.enumerated().map { r, row in
             let isHeader = r < headerRows
-            let rowStart = result.length
-            for col in 0..<ncol {
-                let cellSpans = col < row.count ? row[col] : []
-                result.append(spansAttributedString(cellSpans, baseFont: isHeader ? headerFont : theme.bodyFont,
-                                                     baseColor: theme.textColor, theme: theme))
-                if col < ncol - 1 { result.append(NSAttributedString(string: "\t")) }
-            }
-            result.append(NSAttributedString(string: "\n"))
-            let ps = NSMutableParagraphStyle()
-            ps.minimumLineHeight = lineHeight
-            ps.maximumLineHeight = lineHeight
-            ps.tabStops = tabStops
-            ps.defaultTabInterval = colWidth
-            let rowRange = NSRange(location: rowStart, length: result.length - rowStart)
-            result.addAttribute(.paragraphStyle, value: ps, range: rowRange)
-            if isHeader {
-                result.addAttribute(.backgroundColor, value: Palette.tableHeaderBg, range: rowRange)
-                if r == headerRows - 1 {
-                    result.addAttribute(.underlineStyle, value: NSUnderlineStyle.single.rawValue, range: rowRange)
-                    result.addAttribute(.underlineColor, value: Palette.tableBorder, range: rowRange)
-                }
-            }
+            return row.map { spansAttributedString($0, baseFont: isHeader ? headerFont : theme.bodyFont,
+                                                    baseColor: theme.textColor, theme: theme) }
         }
+        result.append(TableBlockBuilder.build(rows: cellRows, headerRows: headerRows, theme: theme))
+        result.append(NSAttributedString(string: "\n"))
     }
 
     // MARK: Images
 
-    /// Reserves EXACTLY `size` via `SizedAttachmentCell`, image left `nil` — pixels arrive in a
-    /// later sprint. This is invariant 1 of this codebase: the reserved layout size must NEVER
-    /// depend on whether an image is loaded, or the scroll bar swings when it loads/purges.
-    private static func appendImage(id: String, size: CGSize, into result: NSMutableAttributedString) {
+    /// Word DRAWS an image at its declared size regardless of the asset's own pixel dimensions (a
+    /// 300px PNG placed at 225pt is ordinary), so — unlike a markdown image, whose true size is
+    /// unknown until the bytes arrive — the declared size here is already authoritative. The only
+    /// adjustment left is column-fitting: shrink proportionally if it's wider than the page. Doing
+    /// that HERE, from the declared size alone, means `MarkdownDocument.reconcileMedia` never has
+    /// to recompute a fit from real pixels for an office image — which matters, because
+    /// recomputing on load is exactly the scroll-bar-jitter invariant 1 exists to prevent (an
+    /// office image's pixel dimensions can legitimately disagree with its declared size).
+    private static func fittedOfficeSize(_ declared: CGSize, columnWidth: CGFloat) -> CGSize {
+        guard declared.width > columnWidth, declared.width > 0 else { return declared }
+        let scale = columnWidth / declared.width
+        return CGSize(width: columnWidth.rounded(), height: (declared.height * scale).rounded())
+    }
+
+    /// Reserves the (column-fitted) declared size via `SizedAttachmentCell`, image left `nil` —
+    /// pixels arrive lazily via `MarkdownDocument.reconcileMedia`. This is invariant 1 of this
+    /// codebase: the reserved layout size must NEVER depend on whether an image is loaded, or the
+    /// scroll bar swings when it loads/purges.
+    private static func appendImage(id: String, size: CGSize, columnWidth: CGFloat,
+                                    into result: NSMutableAttributedString) {
+        let fitted = fittedOfficeSize(size, columnWidth: columnWidth)
         let att = NSTextAttachment()
-        att.bounds = NSRect(origin: .zero, size: size)
-        att.attachmentCell = SizedAttachmentCell(reservedSize: size)
+        att.bounds = NSRect(origin: .zero, size: fitted)
+        att.attachmentCell = SizedAttachmentCell(reservedSize: fitted)
         let ph = NSMutableAttributedString(attachment: att)
         ph.addAttribute(MDAttr.image, value: id, range: NSRange(location: 0, length: ph.length))
         result.append(ph)

@@ -10,6 +10,13 @@ final class MarkdownDocument: NSDocument {
     /// Empty for every other kind.
     private(set) var officeBlocks: [OfficeBlock] = []
 
+    /// The archive `officeBlocks` was parsed from, kept so an `.image` block's id (an archive entry
+    /// path, e.g. `"word/media/image1.png"`) can be pulled on demand when it scrolls into view — the
+    /// same lazy-pixels discipline `reconcileMedia` already gives markdown images, not a second
+    /// cache (unzipping a PNG is cheap; a disk cache exists elsewhere only because a WebKit round
+    /// trip is not). `nil` for every other kind.
+    private(set) var officeArchive: ZipArchive?
+
     // C3: bumped on every full render; async mermaid swaps from a previous render carry
     // a stale generation and abort before mutating, so only the latest render wins.
     private var renderGeneration = 0
@@ -77,7 +84,17 @@ final class MarkdownDocument: NSDocument {
             return
         }
         let archive = try ZipArchive(data: data)
-        self.officeBlocks = try DocxReader.read(archive)
+        setOfficeContent(blocks: try DocxReader.read(archive), archive: archive)
+    }
+
+    /// The office-document seam `read(from:)` and `reloadDocument` both go through: the parser's
+    /// output plus the archive it came from, which `reconcileMedia` needs to resolve an `.image`
+    /// block's id to bytes. Not `private` — `OfficeDocumentTests` drives image loading against
+    /// synthetic blocks/archives it builds itself, independent of whatever `DocxReader` parses (that
+    /// parser's own correctness is `DocxReaderTests`' job, not this file's).
+    func setOfficeContent(blocks: [OfficeBlock], archive: ZipArchive) {
+        self.officeBlocks = blocks
+        self.officeArchive = archive
         self.text = ""
         self.file = TextFile(text: "", encoding: .utf8, hasBOM: false)
     }
@@ -115,7 +132,7 @@ final class MarkdownDocument: NSDocument {
                 // path (invariant: an office document's bytes are never handed to
                 // `TextEncodingDetector`).
                 if let archive = try? ZipArchive(data: data), let blocks = try? DocxReader.read(archive) {
-                    officeBlocks = blocks
+                    setOfficeContent(blocks: blocks, archive: archive)
                 }
             } else {
                 let reread = TextEncodingDetector.decode(data)
@@ -404,7 +421,11 @@ final class MarkdownDocument: NSDocument {
         // Rebuilt from blocks every render, not cached: a font-size change (⌘+/⌘−) or ⌘R must
         // reflow office text exactly like markdown does — a finished string would freeze the
         // document at whatever size it was first opened at.
-        case .office: attr = OfficeTextBuilder.build(officeBlocks, theme: theme)
+        // The reader's real column width, so an office image is column-fitted at build time (see
+        // `OfficeTextBuilder.appendImage`) — the same width `presizeKnownMedia` reads for markdown,
+        // already real by this point (set in `DocumentWindowController.init`/`display`).
+        case .office: attr = OfficeTextBuilder.build(officeBlocks, theme: theme,
+                                                      columnWidth: wc.textView.textContainer?.size.width ?? 800)
         }
         wc.display(attr)
         wc.window?.title = displayName ?? "fast-md-reader"
@@ -484,6 +505,12 @@ final class MarkdownDocument: NSDocument {
     /// Decoded-image cache keyed by resolved absolute URL string (muya's loadImageMap).
     private static let imageCache = NSCache<NSString, NSImage>()
 
+    /// Decoded-image cache for office documents, keyed by "path|archive entry id" (see the cache
+    /// key comment in `reconcileMedia` for why the id alone is not enough). Separate from
+    /// `imageCache`: an office id and a markdown src string share no format, so keeping them apart
+    /// avoids having to prove they can never collide.
+    private static let officeImageCache = NSCache<NSString, NSImage>()
+
     /// Column-fit a raw pixel size, honoring an explicit width (HTML/Pandoc/Obsidian) or shrinking
     /// oversized images to the column width.
     private func fittedSize(_ pixelSize: NSSize, _ storage: NSTextStorage, _ range: NSRange, maxWidth: CGFloat) -> NSSize {
@@ -539,14 +566,21 @@ final class MarkdownDocument: NSDocument {
         let baseDir = fileURL?.deletingLastPathComponent()
         let whole = NSRange(location: 0, length: storage.length)
         var sets: [(NSSize, NSRange)] = []
-        storage.enumerateAttribute(MDAttr.image, in: whole) { v, r, _ in
-            guard let src = v as? String, !src.hasPrefix("data:"),
-                  let url = self.resolveImageURL(src, baseDir: baseDir) else { return }
-            if url.isFileURL {
-                guard let px = MarkdownDocument.imagePixelSize(url) else { return }
-                sets.append((px, r))
-            } else if let px = MarkdownDocument.remoteSizes[url.absoluteString] {
-                sets.append((px, r))
+        // An office image's `MDAttr.image` value is an archive entry id ("word/media/image1.png"),
+        // not a URL/path — `resolveImageURL` would misread it as one relative to the document's
+        // folder. Skip it: `OfficeTextBuilder` already reserved its exact (column-fitted) size at
+        // build time, so there is nothing to presize here (invariant: office sizing happens once,
+        // at build time — never re-derived from a path).
+        if kind != .office {
+            storage.enumerateAttribute(MDAttr.image, in: whole) { v, r, _ in
+                guard let src = v as? String, !src.hasPrefix("data:"),
+                      let url = self.resolveImageURL(src, baseDir: baseDir) else { return }
+                if url.isFileURL {
+                    guard let px = MarkdownDocument.imagePixelSize(url) else { return }
+                    sets.append((px, r))
+                } else if let px = MarkdownDocument.remoteSizes[url.absoluteString] {
+                    sets.append((px, r))
+                }
             }
         }
         storage.enumerateWebBlocks(in: whole) { block, r in
@@ -609,13 +643,28 @@ final class MarkdownDocument: NSDocument {
             att.image = nil                 // reserved size (cell) unchanged → space kept, no reflow
             wc.redrawGlyphs(r)              // repaint the now-empty reserved area
         }
+        // Office counterpart of `load`: PAINT ONLY. `OfficeTextBuilder` already reserved the exact,
+        // column-fitted area at build time from the DECLARED size — an office image's own pixel
+        // dimensions are not authoritative (Word draws it at the declared size regardless), so
+        // recomputing a fit from the loaded pixels here would be actively wrong, not just redundant.
+        // Deliberately never touches `cell.reservedSize`/`att.bounds`/`storage.edited`/`ensureLayout`
+        // — that is invariant 1 (scroll-bar stability), and it is why this is its own function
+        // rather than a branch inside `load` that someone could accidentally "simplify" back together.
+        func loadOfficePixels(_ image: NSImage?, _ r: NSRange) {
+            guard gen == self.renderGeneration, r.location < storage.length, let att = attach(r) else { return }
+            att.image = image ?? MarkdownDocument.brokenImage()
+            wc.redrawGlyphs(r)
+            wc.refreshAfterImageFill()
+        }
 
         // Collect first (don't mutate storage while enumerating its attributes).
         var purge: [NSRange] = [], imgLoad: [(String, NSRange)] = [], mmLoad: [(WebBlock, NSRange)] = []
+        var officeLoad: [(String, NSRange)] = []
         storage.enumerateAttribute(MDAttr.image, in: whole) { v, r, _ in
             guard let src = v as? String, !src.isEmpty, let att = attach(r) else { return }
             if onScreen(r) {
                 guard att.image == nil else { return }
+                if kind == .office { officeLoad.append((src, r)); return }
                 // Mid-measure, an unmeasured remote image has no exact size yet — filling it now
                 // would resize under the reader. The measure pass fills it once it's sized.
                 if self.isMeasuringRemote, !src.hasPrefix("data:"),
@@ -657,6 +706,20 @@ final class MarkdownDocument: NSDocument {
                     }
                 }
             } else { load(nil, r) }
+        }
+        for (id, r) in officeLoad {
+            // Keyed by document path + archive entry id, NOT id alone: every `.docx` names its media
+            // "word/media/image1.png", "image2.png", … — the SAME id means a DIFFERENT picture in a
+            // different file, so an id-only key would serve one document's image inside another.
+            let cacheKey = "\(fileURL?.path ?? "")|\(id)" as NSString
+            if let c = MarkdownDocument.officeImageCache.object(forKey: cacheKey) {
+                loadOfficePixels(c, r)
+            } else {
+                MarkdownDocument.loadOfficeImage(archive: officeArchive, id: id) { [weak wc] img in
+                    if let img { MarkdownDocument.officeImageCache.setObject(img, forKey: cacheKey) }
+                    if wc != nil { loadOfficePixels(img, r) }
+                }
+            }
         }
         if !mmLoad.isEmpty {
             let renderer = WebBlockRenderer()   // cache-first: reloads hit the disk cache, no WebKit
@@ -761,6 +824,21 @@ final class MarkdownDocument: NSDocument {
                 let img = data.flatMap { NSImage(data: $0) }
                 DispatchQueue.main.async { completion(img) }
             }.resume()
+        }
+    }
+
+    /// Pulls an office image's bytes out of the archive and decodes them, off the main thread:
+    /// `ZipArchive.data(for:)` inflates DEFLATE (real work for a large picture) and `NSImage(data:)`
+    /// decodes it, neither of which belongs on the thread the reader is drawing on. An
+    /// unresolvable id (the sandbox has no path to reach — an external `r:link`, a dangling
+    /// relationship) or a missing archive/entry degrades to `nil` (→ the broken-image placeholder in
+    /// `loadOfficePixels`) rather than crashing or attempting a filesystem read that would only fail
+    /// silently.
+    private static func loadOfficeImage(archive: ZipArchive?, id: String, completion: @escaping (NSImage?) -> Void) {
+        guard let archive, !id.hasPrefix("docx-unresolvable:") else { completion(nil); return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let img = (try? archive.data(for: id)).flatMap { NSImage(data: $0) }
+            DispatchQueue.main.async { completion(img) }
         }
     }
 

@@ -230,22 +230,34 @@ final class OfficeTextBuilderTests: XCTestCase {
 
     // MARK: Tables
 
+    /// Every `NSTextTableBlock` in `out`, in the order TextKit reports them, via the same
+    /// paragraph-style enumeration `MarkdownRendererTests` uses to characterize markdown tables —
+    /// office tables now go through the identical `TableBlockBuilder`, so they're inspected the
+    /// same way.
+    private func tableBlocks(in out: NSAttributedString) -> [NSTextTableBlock] {
+        var blocks: [NSTextTableBlock] = []
+        out.enumerateAttribute(.paragraphStyle, in: NSRange(location: 0, length: out.length)) { value, _, _ in
+            guard let ps = value as? NSParagraphStyle else { return }
+            for tb in ps.textBlocks {
+                if let block = tb as? NSTextTableBlock { blocks.append(block) }
+            }
+        }
+        return blocks
+    }
+
     /// A 2x2 table where one cell is empty must keep both rows at the same column count — the
-    /// empty cell still leaves its tab, it doesn't collapse the row. `headerRows: 1` is today's
-    /// asserted shape behaviour, kept as-is.
+    /// empty cell still occupies its `NSTextTableBlock`, it doesn't collapse the row or shift the
+    /// remaining column. `headerRows: 1` is today's asserted shape behaviour, kept as-is.
     func testTableWithHeaderRowAndAnEmptyCellKeepsItsRowAndColumnShape() {
         let rows: [[[Span]]] = [
             [[span("Name")], [span("Score")]],
             [[], [span("42")]],
         ]
         let out = build([.table(rows: rows, headerRows: 1)])
-        let lines = out.string.split(separator: "\n", omittingEmptySubsequences: false)
-        let headerCells = String(lines[0]).components(separatedBy: "\t")
-        let bodyCells = String(lines[1]).components(separatedBy: "\t")
-        XCTAssertEqual(headerCells, ["Name", "Score"])
-        XCTAssertEqual(bodyCells.count, 2, "the empty first cell must still leave its column tab")
-        XCTAssertEqual(bodyCells[0], "")
-        XCTAssertEqual(bodyCells[1], "42")
+        let blocks = tableBlocks(in: out)
+        XCTAssertEqual(blocks.count, 4, "2 header cells + 2 body cells, empty cell included")
+        let bodyRowCols = Set(blocks.filter { $0.startingRow == 1 }.map(\.startingColumn))
+        XCTAssertEqual(bodyRowCols, [0, 1], "the empty first cell must still keep its column in place")
     }
 
     /// Same shape guarantee with NO header row at all — a headerless table (the common case in the
@@ -256,22 +268,20 @@ final class OfficeTextBuilderTests: XCTestCase {
             [[span("Name")], [span("Score")]],
         ]
         let out = build([.table(rows: rows, headerRows: 0)])
-        let lines = out.string.split(separator: "\n", omittingEmptySubsequences: false)
-        let firstRowCells = String(lines[0]).components(separatedBy: "\t")
-        let secondRowCells = String(lines[1]).components(separatedBy: "\t")
-        XCTAssertEqual(firstRowCells.count, 2, "the empty first cell must still leave its column tab")
-        XCTAssertEqual(firstRowCells[0], "")
-        XCTAssertEqual(firstRowCells[1], "42")
-        XCTAssertEqual(secondRowCells, ["Name", "Score"])
+        let blocks = tableBlocks(in: out)
+        XCTAssertEqual(blocks.count, 4)
+        let firstRowCols = Set(blocks.filter { $0.startingRow == 0 }.map(\.startingColumn))
+        XCTAssertEqual(firstRowCols, [0, 1], "the empty first cell must still keep its column in place")
     }
 
     func testTableHeaderRowIsShadedWithThemeHeaderBackground() {
         let out = build([.table(rows: [[[span("H1")], [span("H2")]], [[span("v1")], [span("v2")]]], headerRows: 1)])
-        let headerBg = out.attribute(.backgroundColor, at: 0, effectiveRange: nil) as? NSColor
-        XCTAssertEqual(headerBg, Palette.tableHeaderBg)
-        let bodyRowStart = (out.string as NSString).range(of: "v1").location
-        let bodyBg = out.attribute(.backgroundColor, at: bodyRowStart, effectiveRange: nil) as? NSColor
-        XCTAssertNil(bodyBg, "only the header row is shaded")
+        let blocks = tableBlocks(in: out)
+        let headerBgs = blocks.filter { $0.startingRow == 0 }.compactMap(\.backgroundColor)
+        XCTAssertEqual(headerBgs.count, 2)
+        XCTAssertTrue(headerBgs.allSatisfy { $0 == Palette.tableHeaderBg })
+        let bodyBgs = blocks.filter { $0.startingRow == 1 }.compactMap(\.backgroundColor)
+        XCTAssertTrue(bodyBgs.isEmpty, "only the header row is shaded")
     }
 
     /// `headerRows: 0` — the "source can't tell us" case — must render row 0 as ordinary content:
@@ -281,8 +291,42 @@ final class OfficeTextBuilderTests: XCTestCase {
         let out = build([.table(rows: [[[span("H1")], [span("H2")]], [[span("v1")], [span("v2")]]], headerRows: 0)])
         let font = out.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
         XCTAssertFalse(font!.fontDescriptor.symbolicTraits.contains(.bold), "headerRows: 0 must not bold row 0")
-        let bg = out.attribute(.backgroundColor, at: 0, effectiveRange: nil) as? NSColor
-        XCTAssertNil(bg, "headerRows: 0 must not shade row 0")
+        let blocks = tableBlocks(in: out)
+        XCTAssertTrue(blocks.allSatisfy { $0.backgroundColor == nil }, "headerRows: 0 must not shade any row")
+    }
+
+    /// The point of this whole sprint: a Word table and a markdown table with the same logical
+    /// content (2 columns, 1 header row, 2 body rows) must produce structurally EQUIVALENT table
+    /// blocks — same cell count, same row/column placement, same border colour, same header
+    /// shading — because both now go through `TableBlockBuilder`. Font/text differ (different
+    /// source pipelines feed the cell content), so this compares block STRUCTURE, not the string.
+    func testOfficeAndMarkdownTablesWithSameContentProduceStructurallyEquivalentBlocks() {
+        let officeOut = build([.table(rows: [
+            [[span("A")], [span("B")]],
+            [[span("1")], [span("2")]],
+        ], headerRows: 1)])
+        let markdownOut = MarkdownRenderer.render("| A | B |\n|---|---|\n| 1 | 2 |", theme: theme)
+
+        let officeBlocks = tableBlocks(in: officeOut)
+        var markdownBlocks: [NSTextTableBlock] = []
+        markdownOut.enumerateAttribute(.paragraphStyle, in: NSRange(location: 0, length: markdownOut.length)) { value, _, _ in
+            guard let ps = value as? NSParagraphStyle else { return }
+            for tb in ps.textBlocks { if let block = tb as? NSTextTableBlock { markdownBlocks.append(block) } }
+        }
+
+        XCTAssertEqual(officeBlocks.count, 4)
+        XCTAssertEqual(officeBlocks.count, markdownBlocks.count)
+        func shape(_ blocks: [NSTextTableBlock]) -> [[Int]] {
+            blocks.map { [$0.startingRow, $0.startingColumn] }
+        }
+        XCTAssertEqual(shape(officeBlocks), shape(markdownBlocks))
+        XCTAssertEqual(officeBlocks.filter { $0.backgroundColor != nil }.count, 2)
+        XCTAssertEqual(officeBlocks.filter { $0.backgroundColor != nil }.count,
+                       markdownBlocks.filter { $0.backgroundColor != nil }.count)
+        let officeBorders = Set(officeBlocks.compactMap { $0.borderColor(for: .minX) })
+        let markdownBorders = Set(markdownBlocks.compactMap { $0.borderColor(for: .minX) })
+        XCTAssertEqual(officeBorders, markdownBorders)
+        XCTAssertEqual(officeBorders, [Palette.tableBorder])
     }
 
     // MARK: Images
@@ -304,5 +348,33 @@ final class OfficeTextBuilderTests: XCTestCase {
         XCTAssertEqual(sizedCell?.reservedSize, size)
         let idValue = out.attribute(MDAttr.image, at: 0, effectiveRange: nil) as? String
         XCTAssertEqual(idValue, "rel42")
+    }
+
+    /// A declared size WIDER than the column must scale down proportionally (aspect ratio
+    /// preserved) — and the decision must be made HERE, at build time, from the declared size
+    /// alone, not deferred to load time (see `MarkdownDocument.reconcileMedia`'s office branch,
+    /// which only ever paints — never resizes — an office image).
+    func testImageWiderThanColumnScalesDownProportionallyAtBuildTime() throws {
+        let declared = CGSize(width: 2000, height: 1000)   // 2:1 aspect
+        let out = OfficeTextBuilder.build([.image(id: "wide", size: declared)], theme: theme, columnWidth: 700)
+        var found: NSTextAttachment?
+        out.enumerateAttribute(.attachment, in: NSRange(location: 0, length: out.length)) { value, _, _ in
+            if let att = value as? NSTextAttachment { found = att }
+        }
+        let attachment = try XCTUnwrap(found)
+        let cell = try XCTUnwrap(attachment.attachmentCell as? SizedAttachmentCell)
+        XCTAssertEqual(cell.reservedSize.width, 700, accuracy: 0.5)
+        XCTAssertEqual(cell.reservedSize.height, 350, accuracy: 0.5, "aspect ratio (2:1) must be preserved")
+        XCTAssertEqual(attachment.bounds.size, cell.reservedSize)
+    }
+
+    /// A declared size that already fits the column must pass through unchanged — scaling must
+    /// never enlarge an image past its authored size.
+    func testImageNarrowerThanColumnIsReservedAtItsDeclaredSize() {
+        let declared = CGSize(width: 240, height: 135)
+        let out = OfficeTextBuilder.build([.image(id: "small", size: declared)], theme: theme, columnWidth: 700)
+        let cell = out.attribute(.attachment, at: 0, effectiveRange: nil)
+            .flatMap { ($0 as? NSTextAttachment)?.attachmentCell as? SizedAttachmentCell }
+        XCTAssertEqual(cell?.reservedSize, declared)
     }
 }

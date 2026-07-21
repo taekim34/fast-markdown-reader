@@ -650,36 +650,17 @@ private struct AttributedBuilder: MarkupWalker {
         let ncol = max(headerCells.count, bodyRows.map(\.count).max() ?? 0)
         guard ncol > 0 else { newline(); tagBlock(from: start, src: table.range); return }
 
-        // Native NSTextTable → real bordered grid with header shading and cell padding, laid
-        // out by TextKit (replaces the old monospaced "|"-joined text that wrapped into mush).
-        // Cell content is rendered inline so `code`, **bold**, and links work inside cells.
-        let textTable = NSTextTable()
-        textTable.numberOfColumns = ncol
-        textTable.setContentWidth(100, type: .percentageValueType)
-
-        func appendRow(_ cells: [Markdown.Table.Cell], row: Int, header: Bool) {
-            for col in 0..<ncol {
-                let block = NSTextTableBlock(table: textTable, startingRow: row, rowSpan: 1,
-                                             startingColumn: col, columnSpan: 1)
-                block.setBorderColor(Palette.tableBorder)
-                block.setWidth(1, type: .absoluteValueType, for: .border)
-                block.setWidth(7, type: .absoluteValueType, for: .padding)
-                if header { block.backgroundColor = Palette.tableHeaderBg }
-                let ps = NSMutableParagraphStyle()
-                ps.textBlocks = [block]
-                let cellLH = (theme.baseFontSize * 1.4).rounded()
-                ps.minimumLineHeight = cellLH; ps.maximumLineHeight = cellLH
-                let font = header ? NSFont.systemFont(ofSize: theme.baseFontSize, weight: .semibold) : theme.bodyFont
-                let content = NSMutableAttributedString()
-                if col < cells.count { content.append(inlineString(cells[col], font: font, color: theme.textColor)) }
-                content.append(NSAttributedString(string: "\n", attributes: [.font: font]))
-                content.addAttribute(.paragraphStyle, value: ps,
-                                     range: NSRange(location: 0, length: content.length))
-                result.append(content)
-            }
+        // Real bordered grid via the shared `TableBlockBuilder` (also used by office tables) —
+        // replaces the old monospaced "|"-joined text that wrapped into mush. Cell content is
+        // rendered inline here so `code`, **bold**, and links work inside cells; the builder only
+        // lays already-styled strings into `NSTextTableBlock` cells.
+        func renderRow(_ cells: [Markdown.Table.Cell], header: Bool) -> [NSAttributedString] {
+            let font = header ? NSFont.systemFont(ofSize: theme.baseFontSize, weight: .semibold) : theme.bodyFont
+            return cells.map { inlineString($0, font: font, color: theme.textColor) }
         }
-        appendRow(headerCells, row: 0, header: true)
-        for (i, row) in bodyRows.enumerated() { appendRow(row, row: i + 1, header: false) }
+        var rows = [renderRow(headerCells, header: true)]
+        rows.append(contentsOf: bodyRows.map { renderRow($0, header: false) })
+        result.append(TableBlockBuilder.build(rows: rows, headerRows: 1, theme: theme))
         newline()
         tagBlock(from: start, src: table.range)
     }

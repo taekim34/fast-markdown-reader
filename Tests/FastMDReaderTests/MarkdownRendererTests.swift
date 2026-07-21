@@ -42,6 +42,38 @@ final class MarkdownRendererTests: XCTestCase {
         }
     }
 
+    /// Characterizes the real bordered grid `MarkdownRenderer.visitTable` produces via
+    /// `NSTextTable`/`NSTextTableBlock` — written BEFORE extracting that construction into
+    /// `TableBlockBuilder`, so any drift in the extraction shows up here first.
+    func testGFMTableUsesRealTextTableWithBorderAndHeaderShading() {
+        let s = render("| A | B |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |")
+        var blocks: [NSTextTableBlock] = []
+        var headerBackgrounds: [NSColor] = []
+        var borderColors: Set<NSColor> = []
+        s.enumerateAttribute(.paragraphStyle, in: NSRange(location: 0, length: s.length)) { value, _, _ in
+            guard let ps = value as? NSParagraphStyle else { return }
+            for tb in ps.textBlocks {
+                guard let block = tb as? NSTextTableBlock else { continue }
+                blocks.append(block)
+                if let bc = block.borderColor(for: .minX) { borderColors.insert(bc) }
+                if let bg = block.backgroundColor { headerBackgrounds.append(bg) }
+            }
+        }
+        // 2 header cells + 2 body rows * 2 cells = 6 table blocks total.
+        XCTAssertEqual(blocks.count, 6)
+        // Every cell in the same table shares one NSTextTable (real grid, not per-cell islands).
+        let tables = Set(blocks.map { ObjectIdentifier($0.table) })
+        XCTAssertEqual(tables.count, 1)
+        // Exactly the 2 header cells (row 0) are shaded — headerRows defaults to 1 for markdown.
+        XCTAssertEqual(headerBackgrounds.count, 2)
+        XCTAssertEqual(borderColors, [Palette.tableBorder])
+        // Row/column placement is exact: header row occupies startingRow 0, columns 0 and 1.
+        let headerCols = Set(blocks.filter { $0.startingRow == 0 }.map(\.startingColumn))
+        XCTAssertEqual(headerCols, [0, 1])
+        let bodyRows = Set(blocks.filter { $0.startingRow != 0 }.map(\.startingRow))
+        XCTAssertEqual(bodyRows, [1, 2])
+    }
+
     func testHeadingIsTaggedWithMDAttr() {
         // Contract for keyboard heading-jump (C5): every heading run carries MDAttr.heading.
         let s = render("# One\n\nbody\n\n## Two")

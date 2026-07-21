@@ -14,13 +14,19 @@ final class DocxReaderTests: XCTestCase {
         [UInt8(v & 0xFF), UInt8((v >> 8) & 0xFF), UInt8((v >> 16) & 0xFF), UInt8((v >> 24) & 0xFF)]
     }
 
-    /// Builds a minimal `.docx`-shaped archive: `word/document.xml` always, `word/styles.xml`
-    /// and `word/numbering.xml` only when provided (Word itself omits `numbering.xml` from
-    /// documents with no lists — several tests below exercise that).
-    private func buildDocx(document: String, styles: String? = nil, numbering: String? = nil) -> Data {
+    /// Builds a minimal `.docx`-shaped archive: `word/document.xml` always, `word/styles.xml`,
+    /// `word/numbering.xml` and `word/_rels/document.xml.rels` only when provided (Word itself
+    /// omits `numbering.xml` from documents with no lists, and a document with no relationships
+    /// at all omits the `.rels` part too — several tests below exercise both).
+    private func buildDocx(
+        document: String, styles: String? = nil, numbering: String? = nil, rels: String? = nil,
+        media: [(name: String, bytes: [UInt8])] = []
+    ) -> Data {
         var entries: [(String, Data)] = [("word/document.xml", Data(document.utf8))]
         if let styles { entries.append(("word/styles.xml", Data(styles.utf8))) }
         if let numbering { entries.append(("word/numbering.xml", Data(numbering.utf8))) }
+        if let rels { entries.append(("word/_rels/document.xml.rels", Data(rels.utf8))) }
+        for (name, bytes) in media { entries.append(("word/media/" + name, Data(bytes))) }
         return buildZip(entries)
     }
 
@@ -82,6 +88,12 @@ final class DocxReaderTests: XCTestCase {
 
     private func read(document: String, styles: String? = nil, numbering: String? = nil) throws -> [OfficeBlock] {
         let zip = buildDocx(document: doc(document), styles: styles, numbering: numbering)
+        let archive = try ZipArchive(data: zip)
+        return try DocxReader.read(archive)
+    }
+
+    private func read(document: String, rels: String?, media: [(name: String, bytes: [UInt8])] = []) throws -> [OfficeBlock] {
+        let zip = buildDocx(document: doc(document), rels: rels, media: media)
         let archive = try ZipArchive(data: zip)
         return try DocxReader.read(archive)
     }
@@ -306,6 +318,311 @@ final class DocxReaderTests: XCTestCase {
             [[Span(text: "A")], [Span(text: "B")]],
             [[Span(text: "C")], [Span(text: "D")]],
         ], headerRows: 0)])
+    }
+
+    // MARK: Images
+
+    private func rels(_ pairs: [(id: String, target: String, external: Bool)]) -> String {
+        let entries = pairs.map { pair -> String in
+            let mode = pair.external ? " TargetMode=\"External\"" : ""
+            return "<Relationship Id=\"\(pair.id)\" Type=\"x\" Target=\"\(pair.target)\"\(mode)/>"
+        }.joined()
+        return "<Relationships xmlns=\"x\">\(entries)</Relationships>"
+    }
+
+    private func drawing(cx: Int, cy: Int, embed: String? = nil, link: String? = nil) -> String {
+        let blipAttr = embed.map { "r:embed=\"\($0)\"" } ?? link.map { "r:link=\"\($0)\"" } ?? ""
+        return """
+        <w:drawing><wp:inline><wp:extent cx="\(cx)" cy="\(cy)"/>
+          <a:graphic><a:graphicData><pic:pic><pic:blipFill><a:blip \(blipAttr)/></pic:blipFill></pic:pic></a:graphicData></a:graphic>
+        </wp:inline></w:drawing>
+        """
+    }
+
+    private func vmlPict(style: String, rId: String) -> String {
+        "<w:pict><v:shape style=\"\(style)\"><v:imagedata r:id=\"\(rId)\"/></v:shape></w:pict>"
+    }
+
+    func testEmbeddedDrawingResolvesToMediaEntryNameAndConvertsEMUToPoints() throws {
+        let blocks = try read(
+            document: "<w:p><w:r>\(drawing(cx: 6_400_800, cy: 914_400, embed: "rId8"))</w:r></w:p>",
+            rels: rels([(id: "rId8", target: "media/image1.png", external: false)]))
+        XCTAssertEqual(blocks, [.image(id: "word/media/image1.png", size: CGSize(width: 504, height: 72))])
+    }
+
+    func testAlternateContentEmitsOnlyTheChoiceImageNeverTheFallback() throws {
+        let blocks = try read(
+            document: """
+            <w:p><w:r><mc:AlternateContent>
+              <mc:Choice Requires="wpg">\(drawing(cx: 914_400, cy: 914_400, embed: "rId8"))</mc:Choice>
+              <mc:Fallback>\(vmlPict(style: "width:72pt;height:72pt", rId: "rId8"))</mc:Fallback>
+            </mc:AlternateContent></w:r></w:p>
+            """,
+            rels: rels([(id: "rId8", target: "media/image1.png", external: false)]))
+        XCTAssertEqual(blocks, [.image(id: "word/media/image1.png", size: CGSize(width: 72, height: 72))])
+    }
+
+    func testLinkedExternalImageEmitsUnresolvableSizedBlockNeverZeroSize() throws {
+        let blocks = try read(
+            document: "<w:p><w:r>\(drawing(cx: 914_400, cy: 914_400, link: "rId9"))</w:r></w:p>",
+            rels: rels([(id: "rId9", target: "file:///Users/x/pic.png", external: true)]))
+        XCTAssertEqual(blocks, [.image(id: "docx-unresolvable:file:///Users/x/pic.png", size: CGSize(width: 72, height: 72))])
+    }
+
+    func testStandaloneVMLPictWithNoAlternateContentEmitsOneImageSizedFromStyle() throws {
+        let blocks = try read(
+            document: "<w:p><w:r>\(vmlPict(style: "width:7in;height:185.25pt", rId: "rId10"))</w:r></w:p>",
+            rels: rels([(id: "rId10", target: "media/image2.png", external: false)]))
+        XCTAssertEqual(blocks, [.image(id: "word/media/image2.png", size: CGSize(width: 504, height: 185.25))])
+    }
+
+    func testVMLStyleUnitsAllConvertToPoints() throws {
+        let cases: [(style: String, expected: CGSize)] = [
+            ("width:72pt;height:36pt", CGSize(width: 72, height: 36)),
+            ("width:1in;height:2in", CGSize(width: 72, height: 144)),
+            ("width:96px;height:48px", CGSize(width: 72, height: 36)),
+            ("width:2.54cm;height:1cm", CGSize(width: 72, height: 72 / 2.54)),
+            ("width:25.4mm;height:12.7mm", CGSize(width: 72, height: 36)),
+            ("width:100;height:50", CGSize(width: 100, height: 50)),
+        ]
+        for (index, testCase) in cases.enumerated() {
+            let rId = "rIdVml\(index)"
+            let blocks = try read(
+                document: "<w:p><w:r>\(vmlPict(style: testCase.style, rId: rId))</w:r></w:p>",
+                rels: rels([(id: rId, target: "media/image\(index).png", external: false)]))
+            XCTAssertEqual(blocks, [.image(id: "word/media/image\(index).png", size: testCase.expected)],
+                            "style '\(testCase.style)'")
+        }
+    }
+
+    /// A single `w:drawing` grouping several `pic:pic` (Word's "two logos side by side" shape)
+    /// must yield ONE image block PER embedded picture, never just the first — measured live on
+    /// the real government-guide test file, where dropping this produced only 1 of 2 real images.
+    func testDrawingGroupingMultiplePicturesEmitsOneImagePerPictureNotJustTheFirst() throws {
+        let groupedDrawing = """
+        <w:drawing><wp:inline><wp:extent cx="914400" cy="914400"/>
+          <wpg:wgp>
+            <pic:pic><pic:blipFill><a:blip r:embed="rId8"/></pic:blipFill></pic:pic>
+            <pic:pic><pic:blipFill><a:blip r:embed="rId9"/></pic:blipFill></pic:pic>
+          </wpg:wgp>
+        </wp:inline></w:drawing>
+        """
+        let blocks = try read(
+            document: "<w:p><w:r>\(groupedDrawing)</w:r></w:p>",
+            rels: rels([
+                (id: "rId8", target: "media/image1.png", external: false),
+                (id: "rId9", target: "media/image2.png", external: false),
+            ]))
+        XCTAssertEqual(blocks, [
+            .image(id: "word/media/image1.png", size: CGSize(width: 72, height: 72)),
+            .image(id: "word/media/image2.png", size: CGSize(width: 72, height: 72)),
+        ])
+    }
+
+    /// A group's own `wpg:grpSpPr/a:xfrm` declares BOTH its real-EMU box (`a:ext`) and the
+    /// coordinate space its children are measured in (`a:chExt`) — a child's own extent (in child
+    /// units) converts to real EMU via `ext ÷ chExt` per axis. Numbers measured on the real
+    /// government-guide test file's group (an intermediate group inside a larger nest, used here
+    /// standalone as the minimal case): group `ext 6400800×2352675`, `chExt 10080×3705`, one
+    /// picture with its OWN `ext 1665×3705` (child units) → `1665 × (6400800/10080) ÷ 12700 =
+    /// 83.25 pt`, `3705 × (2352675/3705) ÷ 12700 = 185.25 pt`.
+    func testGroupedPictureSizedByChainingGroupExtOverChExtScale() throws {
+        let groupedDrawing = """
+        <w:drawing><wp:inline><wp:extent cx="6400800" cy="2352675"/>
+          <wpg:wgp>
+            <wpg:grpSpPr><a:xfrm><a:ext cx="6400800" cy="2352675"/><a:chExt cx="10080" cy="3705"/></a:xfrm></wpg:grpSpPr>
+            <pic:pic>
+              <pic:blipFill><a:blip r:embed="rId8"/></pic:blipFill>
+              <pic:spPr><a:xfrm><a:ext cx="1665" cy="3705"/></a:xfrm></pic:spPr>
+            </pic:pic>
+          </wpg:wgp>
+        </wp:inline></w:drawing>
+        """
+        let blocks = try read(
+            document: "<w:p><w:r>\(groupedDrawing)</w:r></w:p>",
+            rels: rels([(id: "rId8", target: "media/image1.png", external: false)]))
+        XCTAssertEqual(blocks, [.image(id: "word/media/image1.png", size: CGSize(width: 83.25, height: 185.25))])
+    }
+
+    /// End-to-end nested chain (group → group → group → two pictures), reproducing the REAL
+    /// government-guide file's exact structure and numbers: three levels deep, the inner two
+    /// levels each an identity scale (`ext == chExt`), only the outermost level actually rescales
+    /// (`×635` both axes). Confirms the chain multiplies correctly across levels rather than only
+    /// working for a single level, and that two DIFFERENTLY-sized pictures in the same nest each
+    /// get their OWN correct size, not the group's shared outer box.
+    func testNestedThreeLevelGroupChainProducesEachPicturesOwnCorrectSize() throws {
+        let nestedDrawing = """
+        <w:drawing><wp:inline><wp:extent cx="6400800" cy="2352675"/>
+          <wpg:wgp>
+            <wpg:grpSpPr><a:xfrm><a:ext cx="6400800" cy="2352675"/><a:chExt cx="10080" cy="3705"/></a:xfrm></wpg:grpSpPr>
+            <wpg:grpSp>
+              <wpg:grpSpPr><a:xfrm><a:ext cx="1665" cy="3705"/><a:chExt cx="1665" cy="3705"/></a:xfrm></wpg:grpSpPr>
+              <wpg:grpSp>
+                <wpg:grpSpPr><a:xfrm><a:ext cx="1665" cy="2160"/><a:chExt cx="1665" cy="2160"/></a:xfrm></wpg:grpSpPr>
+                <pic:pic>
+                  <pic:blipFill><a:blip r:embed="rId8"/></pic:blipFill>
+                  <pic:spPr><a:xfrm><a:ext cx="1140" cy="2160"/></a:xfrm></pic:spPr>
+                </pic:pic>
+                <pic:pic>
+                  <pic:blipFill><a:blip r:embed="rId9"/></pic:blipFill>
+                  <pic:spPr><a:xfrm><a:ext cx="1080" cy="1080"/></a:xfrm></pic:spPr>
+                </pic:pic>
+              </wpg:grpSp>
+            </wpg:grpSp>
+          </wpg:wgp>
+        </wp:inline></w:drawing>
+        """
+        let blocks = try read(
+            document: "<w:p><w:r>\(nestedDrawing)</w:r></w:p>",
+            rels: rels([
+                (id: "rId8", target: "media/image1.png", external: false),
+                (id: "rId9", target: "media/image2.png", external: false),
+            ]))
+        XCTAssertEqual(blocks, [
+            .image(id: "word/media/image1.png", size: CGSize(width: 57, height: 108)),
+            .image(id: "word/media/image2.png", size: CGSize(width: 54, height: 54)),
+        ])
+    }
+
+    /// A group with a picture that has no own `pic:spPr/a:xfrm/a:ext` falls back to the whole
+    /// drawing's `wp:extent` rather than 0.
+    func testPictureInGroupWithNoOwnExtentFallsBackToWholeDrawingExtent() throws {
+        let groupedDrawing = """
+        <w:drawing><wp:inline><wp:extent cx="914400" cy="914400"/>
+          <wpg:wgp>
+            <wpg:grpSpPr><a:xfrm><a:ext cx="914400" cy="914400"/><a:chExt cx="100" cy="100"/></a:xfrm></wpg:grpSpPr>
+            <pic:pic><pic:blipFill><a:blip r:embed="rId8"/></pic:blipFill></pic:pic>
+          </wpg:wgp>
+        </wp:inline></w:drawing>
+        """
+        let blocks = try read(
+            document: "<w:p><w:r>\(groupedDrawing)</w:r></w:p>",
+            rels: rels([(id: "rId8", target: "media/image1.png", external: false)]))
+        XCTAssertEqual(blocks, [.image(id: "word/media/image1.png", size: CGSize(width: 72, height: 72))])
+    }
+
+    // MARK: Non-picture shapes (text boxes, decoration) — never a fake image placeholder
+
+    /// A `w:drawing`/`w:pict` with no picture inside is NOT an image (no "unresolvable" placeholder
+    /// drawn for it) — measured on the real government-guide file's decorative "목차" callout box,
+    /// a shape GROUP with no `pic:pic` at all, only `wps:wsp` AutoShapes carrying `w:txbxContent`
+    /// text. Its typed text is recovered as an ordinary paragraph instead of being silently lost.
+    func testDrawingWithNoPictureButRealTextEmitsThatTextNotAnImagePlaceholder() throws {
+        let shapeGroup = """
+        <w:drawing><wp:inline><wp:extent cx="1115695" cy="799465"/>
+          <wpg:wgp>
+            <wps:wsp><wps:txbx><w:txbxContent><w:p><w:r><w:t>목 차</w:t></w:r></w:p></w:txbxContent></wps:txbx></wps:wsp>
+          </wpg:wgp>
+        </wp:inline></w:drawing>
+        """
+        let blocks = try read(document: "<w:p><w:r>\(shapeGroup)</w:r></w:p>", rels: nil)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "목 차")])])
+    }
+
+    /// A shape with neither a picture nor any typed text (Word's placeholder `<w:p/>` inside an
+    /// otherwise-empty text frame) contributes NOTHING OF ITS OWN — no image placeholder, no text
+    /// block for its empty placeholder paragraph. The containing paragraph is left with exactly
+    /// what it would have if the drawing weren't there at all: since it ALSO carries no other
+    /// text, it still emits the ordinary empty-paragraph "blank line" block every other empty
+    /// paragraph in a document body does (unchanged, pre-existing behaviour — not something this
+    /// shape adds).
+    func testDrawingWithNoPictureAndNoTextContributesNothingOfItsOwn() throws {
+        let emptyShape = """
+        <w:drawing><wp:inline><wp:extent cx="914400" cy="914400"/>
+          <wpg:wgp>
+            <wps:wsp><wps:txbx><w:txbxContent><w:p/></w:txbxContent></wps:txbx></wps:wsp>
+          </wpg:wgp>
+        </wp:inline></w:drawing>
+        """
+        let blocks = try read(document: "<w:p><w:r>\(emptyShape)</w:r></w:p>", rels: nil)
+        XCTAssertEqual(blocks, [.paragraph(spans: [])])
+    }
+
+    /// The precise version of the above: a paragraph that has OTHER real text alongside the
+    /// empty, picture-less shape must show ONLY that text — proving the shape truly contributes
+    /// nothing of its own, rather than the previous test merely coinciding with an already-empty
+    /// paragraph.
+    func testDrawingWithNoPictureAndNoTextAddsNothingAlongsideRealParagraphText() throws {
+        let emptyShape = """
+        <w:drawing><wp:inline><wp:extent cx="914400" cy="914400"/>
+          <wpg:wgp>
+            <wps:wsp><wps:txbx><w:txbxContent><w:p/></w:txbxContent></wps:txbx></wps:wsp>
+          </wpg:wgp>
+        </wp:inline></w:drawing>
+        """
+        let blocks = try read(
+            document: "<w:p><w:r><w:t>Body text</w:t></w:r><w:r>\(emptyShape)</w:r></w:p>", rels: nil)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Body text")])])
+    }
+
+    /// `mc:Fallback` text is skipped exactly like a Fallback picture — a text box wrapped in
+    /// `mc:AlternateContent` must not have its caption appear twice.
+    func testAlternateContentTextBoxEmitsTextOnlyOnceNeverFromFallback() throws {
+        let shapeGroup = """
+        <mc:AlternateContent>
+          <mc:Choice Requires="wpg">
+            <w:drawing><wp:inline><wp:extent cx="914400" cy="914400"/>
+              <wpg:wgp><wps:wsp><wps:txbx><w:txbxContent><w:p><w:r><w:t>Caption</w:t></w:r></w:p></w:txbxContent></wps:txbx></wps:wsp></wpg:wgp>
+            </wp:inline></w:drawing>
+          </mc:Choice>
+          <mc:Fallback>\(vmlPict(style: "width:72pt;height:72pt", rId: "rIdFallback"))</mc:Fallback>
+        </mc:AlternateContent>
+        """
+        let blocks = try read(document: "<w:p><w:r>\(shapeGroup)</w:r></w:p>", rels: nil)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Caption")])])
+    }
+
+    func testVMLShapeWithUnparseableStyleEmitsNonZeroFallbackSizeNotZero() throws {
+        let blocks = try read(
+            document: "<w:p><w:r><w:pict><v:shape><v:imagedata r:id=\"rId10\"/></v:shape></w:pict></w:r></w:p>",
+            rels: rels([(id: "rId10", target: "media/image1.png", external: false)]))
+        guard case .image(_, let size) = blocks.first else { return XCTFail("expected an image block") }
+        XCTAssertGreaterThan(size.width, 0)
+        XCTAssertGreaterThan(size.height, 0)
+    }
+
+    func testEmbedIdWithNoMatchingRelationshipEmitsUnresolvableSizedBlockWithoutCrashing() throws {
+        let blocks = try read(
+            document: "<w:p><w:r>\(drawing(cx: 914_400, cy: 914_400, embed: "rIdMissing"))</w:r></w:p>",
+            rels: nil)
+        XCTAssertEqual(blocks, [.image(id: "docx-unresolvable:rIdMissing", size: CGSize(width: 72, height: 72))])
+    }
+
+    func testImagesAppearInDocumentOrderRelativeToSurroundingParagraphs() throws {
+        let blocks = try read(
+            document: """
+            <w:p><w:r><w:t>Before</w:t></w:r></w:p>
+            <w:p><w:r>\(drawing(cx: 914_400, cy: 914_400, embed: "rId8"))</w:r></w:p>
+            <w:p><w:r><w:t>After</w:t></w:r></w:p>
+            """,
+            rels: rels([(id: "rId8", target: "media/image1.png", external: false)]))
+        XCTAssertEqual(blocks, [
+            .paragraph(spans: [Span(text: "Before")]),
+            .image(id: "word/media/image1.png", size: CGSize(width: 72, height: 72)),
+            .paragraph(spans: [Span(text: "After")]),
+        ])
+    }
+
+    func testImageOnlyParagraphEmitsNoPhantomEmptyTextBlock() throws {
+        let blocks = try read(
+            document: "<w:p><w:r>\(drawing(cx: 914_400, cy: 914_400, embed: "rId8"))</w:r></w:p>",
+            rels: rels([(id: "rId8", target: "media/image1.png", external: false)]))
+        XCTAssertEqual(blocks, [.image(id: "word/media/image1.png", size: CGSize(width: 72, height: 72))])
+    }
+
+    func testParagraphWithBothTextAndAnImageEmitsTextBlockFollowedByImageNotReordered() throws {
+        let blocks = try read(
+            document: "<w:p><w:r><w:t>Caption</w:t></w:r><w:r>\(drawing(cx: 914_400, cy: 914_400, embed: "rId8"))</w:r></w:p>",
+            rels: rels([(id: "rId8", target: "media/image1.png", external: false)]))
+        XCTAssertEqual(blocks, [
+            .paragraph(spans: [Span(text: "Caption")]),
+            .image(id: "word/media/image1.png", size: CGSize(width: 72, height: 72)),
+        ])
+    }
+
+    func testDocumentWithNoImagesAndNoRelsPartStillParsesExactlyAsBefore() throws {
+        let blocks = try read(document: "<w:p><w:r><w:t>Plain text</w:t></w:r></w:p>", rels: nil)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Plain text")])])
     }
 
     // MARK: Archive-level failure and absent optional parts
