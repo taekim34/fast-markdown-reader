@@ -21,6 +21,15 @@ struct Span: Equatable {
     /// backticks at every call site (`` `subscript` ``). `superscript`/`subscripted` reads a little
     /// unevenly next to each other, but stays typeable everywhere without ceremony.
     var subscripted: Bool = false
+    /// Whether THIS run is explicitly marked right-to-left (docx `w:rPr/w:rtl`, a toggle read the
+    /// same on/off way as `bold`/`italic` — see `DocxReader.isOn`: present-and-unset-`w:val` is ON,
+    /// `w:val="0"`/`"false"` is explicitly OFF). This is a RUN-level override for text embedded
+    /// inside a paragraph of the opposite direction (a Latin phrase inside an Arabic sentence, or
+    /// the reverse) — it does not, by itself, decide where the paragraph begins; that is
+    /// `OfficeBlock`'s own `rtl` (see there for why direction is a paragraph property, not a font
+    /// one). ODF's run-level markup (`text:span`) carries no equivalent signal — only a PARAGRAPH
+    /// style's `style:writing-mode` — so an ODT-sourced `Span` never sets this; it stays `false`.
+    var rtl: Bool = false
     /// Bookmark name(s) (docx `w:bookmarkStart`, odt `text:bookmark`/`text:bookmark-start`) whose
     /// target position is the START of this span — empty for ordinary text. `OfficeTextBuilder`
     /// turns a non-empty value into `MDAttr.bookmarkTarget` so an in-document anchor link elsewhere
@@ -72,8 +81,25 @@ struct Cell: Equatable {
 /// nothing about Word, ODF or XML: a parser's only job is to produce this vocabulary, and
 /// `OfficeTextBuilder`'s only job is to consume it, so the two are built and tested apart.
 enum OfficeBlock: Equatable {
-    case heading(level: Int, spans: [Span])
-    case paragraph(spans: [Span])
+    /// Every case below that holds spans also carries `rtl`, defaulted `false` so every existing
+    /// caller (hundreds, mostly tests) that never mentions it keeps meaning "not explicitly marked
+    /// right-to-left" — the same reading an absent source attribute gets.
+    ///
+    /// This is a PARAGRAPH property, not a font one: docx's `w:pPr/w:bidi` and ODT's paragraph-style
+    /// `style:writing-mode="rl-tb"` both mark the whole block, deciding where it BEGINS, which side
+    /// neutral characters (digits, punctuation, brackets) resolve toward at its edges, and — until a
+    /// later sprint reads `w:jc`/`fo:text-align` and an explicit alignment must win over this default
+    /// — which edge the block starts flush against. TextKit's own bidirectional algorithm already
+    /// reorders mixed-direction RUNS correctly within a line once it knows the paragraph's base
+    /// direction; what it cannot recover on its own is THAT base direction when the source doesn't
+    /// say, which is exactly what carrying this bit through from the reader restores (see
+    /// `OfficeTextBuilder`, which turns it into `NSParagraphStyle.baseWritingDirection`, never a
+    /// guessed `NSTextAlignment` — `.natural` alignment already resolves to the right edge once the
+    /// base direction is `.rightToLeft`, so setting alignment explicitly here would just be a second,
+    /// redundant way of saying the same thing and a second place S13/S14 would have to remember to
+    /// override).
+    case heading(level: Int, spans: [Span], rtl: Bool = false)
+    case paragraph(spans: [Span], rtl: Bool = false)
     /// `level` is a 0-based nesting depth. `ordered` selects "1. 2. 3." numbering — per level,
     /// restarting when a SHALLOWER level intervenes but continuing across a deeper nested run —
     /// vs a bullet. See `OfficeTextBuilder` for the exact restart rule.
@@ -93,7 +119,7 @@ enum OfficeBlock: Equatable {
     /// compute — same principle as `image`'s reserved-but-unloaded size, applied to text instead
     /// of pixels). `ordered`/`level` still drive indentation and the bullet glyph even when
     /// `marker` is supplied — only the marker TEXT bypasses the builder's own counters.
-    case listItem(level: Int, ordered: Bool, spans: [Span], marker: String? = nil)
+    case listItem(level: Int, ordered: Bool, spans: [Span], marker: String? = nil, rtl: Bool = false)
     /// Rows of ANCHOR cells only (`rows[row]` lists the cells that START in that row, left to
     /// right — a row's `count` is therefore the number of anchors in it, NOT the column count once
     /// any span is wider than 1; a parser reading `w:gridSpan`/`table:number-columns-spanned` must

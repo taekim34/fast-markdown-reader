@@ -296,7 +296,7 @@ final class DocxReaderTests: XCTestCase {
         // Belt-and-braces on the acceptance criterion itself, not just structural equality above:
         // the word "Moved" must occur exactly once across the whole document.
         let fullText = blocks.compactMap { block -> String? in
-            if case .paragraph(let spans) = block { return spans.map(\.text).joined() }
+            if case .paragraph(let spans, _) = block { return spans.map(\.text).joined() }
             return nil
         }.joined()
         XCTAssertEqual(fullText.components(separatedBy: "Moved").count - 1, 1,
@@ -582,7 +582,7 @@ final class DocxReaderTests: XCTestCase {
             + (1...3).map { numberedItem("70", 0, "l\($0)") }.joined()
         let blocks = try read(document: body, numbering: numbering)
         let markers = blocks.compactMap { block -> String? in
-            if case .listItem(_, _, _, let marker) = block { return marker }
+            if case .listItem(_, _, _, let marker, _) = block { return marker }
             return nil
         }
         XCTAssertEqual(markers, [
@@ -909,7 +909,7 @@ final class DocxReaderTests: XCTestCase {
         // `Cell` holds `blocks`, not `spans`, since S7 — the reader still flattens a nested table
         // into a single `.paragraph` at parse time, so pull its spans back out for this assertion.
         let allText = rows.flatMap { $0 }.flatMap { $0.blocks }.flatMap { block -> [Span] in
-            if case .paragraph(let spans) = block { return spans }
+            if case .paragraph(let spans, _) = block { return spans }
             return []
         }.map(\.text).joined()
         XCTAssertTrue(allText.contains("Outer"), "the cell's own paragraph text must survive")
@@ -1171,6 +1171,88 @@ final class DocxReaderTests: XCTestCase {
             Span(text: "sup", superscript: true),
             Span(text: "sub", subscripted: true),
         ])])
+    }
+
+    // MARK: Writing direction (RTL) — S12
+
+    /// `w:pPr/w:bidi` is a PARAGRAPH-level marker — read the same on/off way `w:b`/`w:i` already
+    /// are (see `isOn`), never by mere presence alone.
+    func testBidiParagraphGetsRightToLeftBaseWritingDirection() throws {
+        let blocks = try read(document: """
+        <w:p><w:pPr><w:bidi/></w:pPr><w:r><w:t>\u{0645}\u{0631}\u{062D}\u{0628}\u{0627}</w:t></w:r></w:p>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "\u{0645}\u{0631}\u{062D}\u{0628}\u{0627}")], rtl: true)])
+    }
+
+    /// The trap this sprint's brief calls out by name: a toggle explicitly turned back OFF
+    /// (`w:val="0"`) must not be read as RTL just because the element is present.
+    func testExplicitlyDisabledBidiIsNotRTL() throws {
+        let blocks = try read(document: """
+        <w:p><w:pPr><w:bidi w:val="0"/></w:pPr><w:r><w:t>Plain</w:t></w:r></w:p>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Plain")], rtl: false)])
+    }
+
+    /// `w:rPr/w:rtl` is a RUN-level marker, independent of the paragraph's own `w:bidi` — an LTR
+    /// paragraph can carry one RTL run (a Hebrew phrase embedded in an English sentence).
+    func testRTLRunCarriesRunLevelDirectionIndependentOfParagraph() throws {
+        let blocks = try read(document: """
+        <w:p>
+          <w:r><w:t>Plain then </w:t></w:r>
+          <w:r><w:rPr><w:rtl/></w:rPr><w:t>\u{05E2}\u{05D1}\u{05E8}\u{05D9}\u{05EA}</w:t></w:r>
+        </w:p>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [
+            Span(text: "Plain then "),
+            Span(text: "\u{05E2}\u{05D1}\u{05E8}\u{05D9}\u{05EA}", rtl: true),
+        ], rtl: false)])
+    }
+
+    /// Same trap as `w:bidi`, at run level: `w:val="false"` (Word writes both spellings) is
+    /// explicitly OFF, not ON-by-presence.
+    func testExplicitlyDisabledRunRTLIsNotRTL() throws {
+        let blocks = try read(document: """
+        <w:p><w:r><w:rPr><w:rtl w:val="false"/></w:rPr><w:t>Plain</w:t></w:r></w:p>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Plain", rtl: false)])])
+    }
+
+    /// A heading and a list item read `w:bidi` exactly the same way a plain paragraph does — this
+    /// is the SAME field on every span-carrying case (see `OfficeBlock`'s doc), not re-derived per
+    /// case.
+    func testBidiHeadingAndListItemAlsoGetRightToLeftBaseWritingDirection() throws {
+        let headingBlocks = try read(
+            document: "<w:p><w:pPr><w:pStyle w:val=\"Heading1\"/><w:bidi/></w:pPr><w:r><w:t>Title</w:t></w:r></w:p>",
+            styles: """
+            <?xml version="1.0" encoding="UTF-8"?><w:styles>
+              <w:style w:type="paragraph" w:styleId="Heading1"><w:pPr><w:outlineLvl w:val="0"/></w:pPr></w:style>
+            </w:styles>
+            """)
+        XCTAssertEqual(headingBlocks, [.heading(level: 1, spans: [Span(text: "Title")], rtl: true)])
+
+        let listBlocks = try read(document: """
+        <w:p><w:pPr><w:bidi/><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr>
+          <w:r><w:t>Item</w:t></w:r></w:p>
+        """, numbering: """
+        <?xml version="1.0" encoding="UTF-8"?><w:numbering>
+          <w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:numFmt w:val="bullet"/></w:lvl></w:abstractNum>
+          <w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>
+        </w:numbering>
+        """)
+        XCTAssertEqual(listBlocks, [.listItem(level: 0, ordered: false, spans: [Span(text: "Item")], rtl: true)])
+    }
+
+    /// The regression guard this sprint's brief demands: an LTR document's parsed blocks are
+    /// unchanged. Every existing `.paragraph(spans:)`/`.heading(level:spans:)`/
+    /// `.listItem(level:ordered:spans:marker:)` construction across this whole file defaults
+    /// `rtl` to `false` and still compares equal (`Equatable`) to a block this reader produces from
+    /// markup with no `w:bidi`/`w:rtl` anywhere — this one test states that explicitly rather than
+    /// leaving it implied by every other test in the file still passing unmodified.
+    func testDocumentWithNoBidiOrRtlMarkupProducesRtlFalseEverywhere() throws {
+        let blocks = try read(document: "<w:p><w:r><w:t>Ordinary</w:t></w:r></w:p>")
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Ordinary")])])
+        guard case .paragraph(_, let rtl) = blocks[0] else { return XCTFail("expected a paragraph") }
+        XCTAssertFalse(rtl)
     }
 
     // MARK: Images

@@ -30,7 +30,7 @@ enum OfficeTextBuilder {
         for block in blocks {
             let start = result.length
             switch block {
-            case let .heading(level, spans):
+            case let .heading(level, spans, rtl):
                 result.append(spansAttributedString(spans, baseFont: theme.headingFont(level: level),
                                                      baseColor: theme.textColor, theme: theme))
                 // Tagged BEFORE the trailing newline is appended, so a substring of this range is
@@ -39,18 +39,18 @@ enum OfficeTextBuilder {
                 result.addAttribute(MDAttr.heading, value: level,
                                      range: NSRange(location: start, length: result.length - start))
                 result.append(NSAttributedString(string: "\n"))
-                result.addAttribute(.paragraphStyle, value: headingParagraphStyle(level: level, theme: theme),
+                result.addAttribute(.paragraphStyle, value: headingParagraphStyle(level: level, theme: theme, rtl: rtl),
                                      range: NSRange(location: start, length: result.length - start))
 
-            case let .paragraph(spans):
+            case let .paragraph(spans, rtl):
                 result.append(spansAttributedString(spans, baseFont: theme.bodyFont,
                                                      baseColor: theme.textColor, theme: theme))
                 result.append(NSAttributedString(string: "\n"))
-                result.addAttribute(.paragraphStyle, value: bodyParagraphStyle(theme: theme),
+                result.addAttribute(.paragraphStyle, value: bodyParagraphStyle(theme: theme, rtl: rtl),
                                      range: NSRange(location: start, length: result.length - start))
 
-            case let .listItem(level, ordered, spans, marker):
-                appendListItem(level: level, ordered: ordered, spans: spans, marker: marker, into: result,
+            case let .listItem(level, ordered, spans, marker, rtl):
+                appendListItem(level: level, ordered: ordered, spans: spans, marker: marker, rtl: rtl, into: result,
                                 theme: theme, orderedCounters: &orderedCounters)
 
             case let .table(rows, headerRows):
@@ -140,6 +140,17 @@ enum OfficeTextBuilder {
             if !span.bookmarks.isEmpty {
                 attrs[MDAttr.bookmarkTarget] = span.bookmarks
             }
+            // An explicitly-marked run (docx `w:rPr/w:rtl`) gets TextKit's own run-level embedding
+            // override — the same mechanism a Unicode RLE/PDF control character would produce, just
+            // stated declaratively instead of via invisible characters in the string. This is
+            // independent of the paragraph's base direction (`OfficeBlock`'s `rtl`): a Latin phrase
+            // embedded in an RTL paragraph never sets this, and a Hebrew phrase embedded in an LTR
+            // one does — TextKit's bidi algorithm already reorders the two correctly around each
+            // other once told which is which.
+            if span.rtl {
+                attrs[.writingDirection] = [NSWritingDirection.rightToLeft.rawValue
+                                             | NSWritingDirectionFormatType.embedding.rawValue]
+            }
             out.append(NSAttributedString(string: span.text, attributes: attrs))
         }
         return out
@@ -162,16 +173,23 @@ enum OfficeTextBuilder {
 
     // MARK: Paragraph styles
 
-    private static func bodyParagraphStyle(theme: RenderTheme) -> NSParagraphStyle {
+    /// `rtl` sets `baseWritingDirection` ONLY when true — an LTR block (`rtl == false`, every
+    /// existing call site before this sprint) leaves it at `NSMutableParagraphStyle()`'s own default
+    /// (`.natural`), so a pre-sprint document's paragraph style is byte-identical to before. `.natural`
+    /// ALIGNMENT is left untouched either way: once the base direction is explicitly `.rightToLeft`,
+    /// `.natural` alignment already resolves to the right edge on its own — see `OfficeBlock`'s doc
+    /// for why that means alignment doesn't need setting here too.
+    private static func bodyParagraphStyle(theme: RenderTheme, rtl: Bool = false) -> NSParagraphStyle {
         let p = NSMutableParagraphStyle()
         let lh = (theme.baseFontSize * 1.45).rounded()
         p.minimumLineHeight = lh
         p.maximumLineHeight = lh
         p.paragraphSpacing = theme.baseFontSize * 0.9
+        if rtl { p.baseWritingDirection = .rightToLeft }
         return p.copy() as! NSParagraphStyle
     }
 
-    private static func headingParagraphStyle(level: Int, theme: RenderTheme) -> NSParagraphStyle {
+    private static func headingParagraphStyle(level: Int, theme: RenderTheme, rtl: Bool = false) -> NSParagraphStyle {
         let b = theme.baseFontSize
         let p = NSMutableParagraphStyle()
         let lh = (theme.headingSize(level: level) * 1.25).rounded()
@@ -179,6 +197,7 @@ enum OfficeTextBuilder {
         p.maximumLineHeight = lh
         p.paragraphSpacing = b * 0.4
         p.paragraphSpacingBefore = b * (level <= 2 ? 1.9 : 1.4)
+        if rtl { p.baseWritingDirection = .rightToLeft }
         return p.copy() as! NSParagraphStyle
     }
 
@@ -196,7 +215,8 @@ enum OfficeTextBuilder {
 
     /// Hanging-indent paragraph style: marker at `markerX`, a tab pushes text to `textX`, and
     /// wrapped lines align at `textX` — so the item's first line and every wrap share one edge.
-    private static func listParagraphStyle(markerX: CGFloat, textX: CGFloat, theme: RenderTheme) -> NSParagraphStyle {
+    private static func listParagraphStyle(markerX: CGFloat, textX: CGFloat, theme: RenderTheme,
+                                            rtl: Bool = false) -> NSParagraphStyle {
         let p = NSMutableParagraphStyle()
         let lh = (theme.baseFontSize * 1.45).rounded()
         p.minimumLineHeight = lh
@@ -206,6 +226,11 @@ enum OfficeTextBuilder {
         p.headIndent = textX
         p.tabStops = [NSTextTab(textAlignment: .left, location: textX)]
         p.defaultTabInterval = textX
+        // The marker/hang-indent geometry (`markerX`/`textX`) is left exactly as it is for an LTR
+        // item — mirroring it for RTL (marker on the right, indent growing leftward) is real work
+        // this sprint's brief scoped out (base direction only); `baseWritingDirection` alone is
+        // enough for TextKit to draw the text right-to-left, just still left-indented.
+        if rtl { p.baseWritingDirection = .rightToLeft }
         return p.copy() as! NSParagraphStyle
     }
 
@@ -225,7 +250,7 @@ enum OfficeTextBuilder {
     /// builder's own counters are a fallback for when the source couldn't supply that text, not a
     /// second, competing numbering scheme — the two never mix for a single item.
     private static func appendListItem(level: Int, ordered: Bool, spans: [Span], marker suppliedMarker: String?,
-                                       into result: NSMutableAttributedString, theme: RenderTheme,
+                                       rtl: Bool = false, into result: NSMutableAttributedString, theme: RenderTheme,
                                        orderedCounters: inout [Int: Int]) {
         let marker: String
         if let suppliedMarker {
@@ -254,7 +279,8 @@ enum OfficeTextBuilder {
             attributes: [.font: theme.bodyFont, .foregroundColor: theme.textColor]))
         result.append(spansAttributedString(spans, baseFont: theme.bodyFont, baseColor: theme.textColor, theme: theme))
         result.append(NSAttributedString(string: "\n"))
-        result.addAttribute(.paragraphStyle, value: listParagraphStyle(markerX: markerX, textX: textX, theme: theme),
+        result.addAttribute(.paragraphStyle,
+                            value: listParagraphStyle(markerX: markerX, textX: textX, theme: theme, rtl: rtl),
                             range: NSRange(location: start, length: result.length - start))
     }
 
@@ -304,12 +330,18 @@ enum OfficeTextBuilder {
         let result = NSMutableAttributedString()
         for (index, block) in blocks.enumerated() {
             switch block {
-            case let .heading(level, spans):
+            // `rtl` is dropped here (`_`), not lost: a cell's own paragraph style comes from
+            // `TableBlockBuilder`'s shared `cellLH` treatment, not from `bodyParagraphStyle`/
+            // `headingParagraphStyle`/`listParagraphStyle` above, so there is nowhere in a cell to
+            // apply a per-block base writing direction without reaching into that shared builder
+            // (out of this sprint's file scope). A cell's RUN-level direction (`Span.rtl`) still
+            // applies, unaffected — it's carried entirely inside `spansAttributedString`.
+            case let .heading(level, spans, _):
                 result.append(spansAttributedString(spans, baseFont: theme.headingFont(level: level),
                                                      baseColor: theme.textColor, theme: theme))
-            case let .paragraph(spans):
+            case let .paragraph(spans, _):
                 result.append(spansAttributedString(spans, baseFont: baseFont, baseColor: theme.textColor, theme: theme))
-            case let .listItem(level, ordered, spans, marker):
+            case let .listItem(level, ordered, spans, marker, _):
                 // Cell-local numbering state — a list embedded in one cell doesn't continue a
                 // count begun in a sibling cell or at top level.
                 var counters: [Int: Int] = [:]

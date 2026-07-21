@@ -131,6 +131,123 @@ final class OdtReaderTests: XCTestCase {
         XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Plain")])])
     }
 
+    // MARK: Writing direction (RTL) — S12
+
+    /// `style:writing-mode="rl-tb"` lives on the PARAGRAPH STYLE, not on `text:p` itself — this
+    /// reader resolves it through the same `text:style-name` lookup `parseParagraphOutlineLevels`
+    /// already uses for headings, in a parallel table (`parseParagraphWritingModes`).
+    func testRTLParagraphStyleGetsRightToLeftBaseWritingDirection() throws {
+        let blocks = try read(
+            body: "<text:p text:style-name=\"Arabic\">\u{0645}\u{0631}\u{062D}\u{0628}\u{0627}</text:p>",
+            automaticStyles: """
+            <style:style style:name="Arabic" style:family="paragraph">
+              <style:paragraph-properties style:writing-mode="rl-tb"/>
+            </style:style>
+            """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "\u{0645}\u{0631}\u{062D}\u{0628}\u{0627}")], rtl: true)])
+    }
+
+    /// Every OTHER `style:writing-mode` value (never just "not rl-tb") reads as NOT right-to-left
+    /// — `lr-tb` is Writer's own default value when the toggle is off, exercised explicitly rather
+    /// than only via absence.
+    func testLRTBWritingModeIsNotRTL() throws {
+        let blocks = try read(
+            body: "<text:p text:style-name=\"Ltr\">Plain</text:p>",
+            automaticStyles: """
+            <style:style style:name="Ltr" style:family="paragraph">
+              <style:paragraph-properties style:writing-mode="lr-tb"/>
+            </style:style>
+            """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Plain")], rtl: false)])
+    }
+
+    /// ODF's docx-equivalent trap: `styles.xml` can declare the SAME style-family name a different,
+    /// unrelated way — only a `style:family="paragraph"` style may ever answer this lookup (mirrors
+    /// `parseTextStyles`'s own family filter).
+    func testWritingModeOnANonParagraphFamilyStyleIsIgnored() throws {
+        let blocks = try read(
+            body: "<text:p text:style-name=\"Arabic\">Plain</text:p>",
+            automaticStyles: """
+            <style:style style:name="Arabic" style:family="text">
+              <style:paragraph-properties style:writing-mode="rl-tb"/>
+            </style:style>
+            """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Plain")], rtl: false)])
+    }
+
+    /// `rl-tb` in `styles.xml` (the document-level styles part) must be found exactly like one in
+    /// `content.xml`'s own `office:automatic-styles` — `parseParagraphWritingModes` is merged from
+    /// BOTH parts, the same way `parseParagraphOutlineLevels`/`parseTextStyles` already are.
+    func testRTLParagraphStyleDeclaredInStylesXMLIsAlsoHonoured() throws {
+        let blocks = try read(
+            body: "<text:p text:style-name=\"Arabic\">\u{0645}\u{0631}\u{062D}\u{0628}\u{0627}</text:p>",
+            styles: """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <office:document-styles>
+              <office:styles>
+                <style:style style:name="Arabic" style:family="paragraph">
+                  <style:paragraph-properties style:writing-mode="rl-tb"/>
+                </style:style>
+              </office:styles>
+            </office:document-styles>
+            """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "\u{0645}\u{0631}\u{062D}\u{0628}\u{0627}")], rtl: true)])
+    }
+
+    /// A heading (via `text:h`) and a list item (`text:list` > `text:list-item` > `text:p`) both
+    /// resolve `style:writing-mode` through their OWN `text:style-name`, exactly like an ordinary
+    /// paragraph — the same field, not re-derived per case (mirrors `DocxReader`'s equivalent test).
+    func testRTLHeadingAndListItemAlsoGetRightToLeftBaseWritingDirection() throws {
+        let headingBlocks = try read(
+            body: "<text:h text:outline-level=\"1\" text:style-name=\"Arabic\">Title</text:h>",
+            automaticStyles: """
+            <style:style style:name="Arabic" style:family="paragraph">
+              <style:paragraph-properties style:writing-mode="rl-tb"/>
+            </style:style>
+            """)
+        XCTAssertEqual(headingBlocks, [.heading(level: 1, spans: [Span(text: "Title")], rtl: true)])
+
+        let listBlocks = try read(
+            body: """
+            <text:list>
+              <text:list-item><text:p text:style-name="Arabic">Item</text:p></text:list-item>
+            </text:list>
+            """,
+            automaticStyles: """
+            <style:style style:name="Arabic" style:family="paragraph">
+              <style:paragraph-properties style:writing-mode="rl-tb"/>
+            </style:style>
+            """)
+        XCTAssertEqual(listBlocks, [.listItem(level: 0, ordered: false, spans: [Span(text: "Item")], rtl: true)])
+    }
+
+    /// ODT's run-level markup (`text:span`) carries no writing-direction signal of its own — unlike
+    /// docx's `w:rPr/w:rtl` — so `Span.rtl` must stay `false` even when the enclosing paragraph is
+    /// explicitly RTL. Documents the format asymmetry `OfficeBlock.swift`'s `Span.rtl` doc comment
+    /// states, rather than leaving it merely implied.
+    func testOdtRunsNeverCarryRunLevelRTLEvenInsideAnRTLParagraph() throws {
+        let blocks = try read(
+            body: "<text:p text:style-name=\"Arabic\"><text:span text:style-name=\"B\">bold</text:span> plain</text:p>",
+            automaticStyles: """
+            <style:style style:name="Arabic" style:family="paragraph">
+              <style:paragraph-properties style:writing-mode="rl-tb"/>
+            </style:style>
+            <style:style style:name="B" style:family="text"><style:text-properties fo:font-weight="bold"/></style:style>
+            """)
+        guard case .paragraph(let spans, let rtl) = blocks[0] else { return XCTFail("expected a paragraph") }
+        XCTAssertTrue(rtl)
+        XCTAssertTrue(spans.allSatisfy { !$0.rtl })
+    }
+
+    /// The regression guard: a document with no `style:writing-mode` anywhere parses with `rtl`
+    /// `false` on every block, exactly as before this sprint.
+    func testDocumentWithNoWritingModeMarkupProducesRtlFalseEverywhere() throws {
+        let blocks = try read(body: "<text:p>Ordinary</text:p>")
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Ordinary")])])
+        guard case .paragraph(_, let rtl) = blocks[0] else { return XCTFail("expected a paragraph") }
+        XCTAssertFalse(rtl)
+    }
+
     // MARK: Paragraphs + span reassembly with mixed content ordering
 
     func testPlainParagraphIsText() throws {
@@ -425,7 +542,7 @@ final class OdtReaderTests: XCTestCase {
         // `Cell` holds `blocks`, not `spans`, since S7 — the reader still flattens a nested table
         // into a single `.paragraph` at parse time, so pull its spans back out for this assertion.
         let allText = rows.flatMap { $0 }.flatMap { $0.blocks }.flatMap { block -> [Span] in
-            if case .paragraph(let spans) = block { return spans }
+            if case .paragraph(let spans, _) = block { return spans }
             return []
         }.map(\.text).joined()
         XCTAssertTrue(allText.contains("Outer"), "outer paragraph text must survive")
@@ -628,7 +745,7 @@ final class OdtReaderTests: XCTestCase {
           <text:note-body><text:p>Note body text.</text:p></text:note-body>
         </text:note> note.</text:p>
         """)
-        guard case .paragraph(let citingSpans) = blocks[0] else { return XCTFail("expected a paragraph") }
+        guard case .paragraph(let citingSpans, _) = blocks[0] else { return XCTFail("expected a paragraph") }
         XCTAssertFalse(citingSpans.contains { $0.text.contains("Note body text.") })
     }
 
@@ -646,7 +763,7 @@ final class OdtReaderTests: XCTestCase {
           <text:note-body><text:p>The first note body text.</text:p></text:note-body>
         </text:note> note.</text:p>
         """)
-        guard case .paragraph(let noteSpans) = blocks[1] else { return XCTFail("expected the appended note paragraph") }
+        guard case .paragraph(let noteSpans, _) = blocks[1] else { return XCTFail("expected the appended note paragraph") }
         XCTAssertEqual(noteSpans.map(\.text).joined(), "1\tThe first note body text.")
     }
 
@@ -960,7 +1077,7 @@ final class OdtReaderTests: XCTestCase {
         let blocks = try DocumentTypes.readOffice(archive, extension: "odt")
         let allText = blocks.flatMap { block -> [String] in
             switch block {
-            case .paragraph(let spans), .heading(_, let spans), .listItem(_, _, let spans, _): return spans.map(\.text)
+            case .paragraph(let spans, _), .heading(_, let spans, _), .listItem(_, _, let spans, _, _): return spans.map(\.text)
             case .table, .image, .unsupportedGraphic, .formula: return []
             }
         }.joined()

@@ -499,6 +499,92 @@ final class OfficeTextBuilderTests: XCTestCase {
         XCTAssertLessThan(subOffset ?? 0, 0, "subscript must lower the baseline")
     }
 
+    // MARK: Writing direction (RTL) — S12
+
+    /// `OfficeBlock.paragraph`'s `rtl` becomes `NSParagraphStyle.baseWritingDirection`, never a
+    /// hand-set `.alignment` — see `OfficeBlock`'s doc comment for why `.natural` alignment already
+    /// resolves to the right edge once the base direction is `.rightToLeft`.
+    func testRTLParagraphGetsRightToLeftBaseWritingDirection() {
+        let out = build([.paragraph(spans: [span("rtl text")], rtl: true)])
+        let style = out.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle
+        XCTAssertEqual(style?.baseWritingDirection, .rightToLeft)
+    }
+
+    /// An LTR paragraph (`rtl` at its default, `false`) is untouched — `baseWritingDirection` stays
+    /// at `NSMutableParagraphStyle()`'s own default, `.natural`, exactly as every pre-sprint
+    /// paragraph already rendered.
+    func testLTRParagraphKeepsNaturalBaseWritingDirection() {
+        let out = build([.paragraph(spans: [span("ltr text")])])
+        let style = out.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle
+        XCTAssertEqual(style?.baseWritingDirection, .natural)
+    }
+
+    /// The same field on a heading and a list item — not something only `.paragraph` respects.
+    func testRTLHeadingAndListItemAlsoGetRightToLeftBaseWritingDirection() {
+        let headingOut = build([.heading(level: 1, spans: [span("Title")], rtl: true)])
+        let headingStyle = headingOut.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle
+        XCTAssertEqual(headingStyle?.baseWritingDirection, .rightToLeft)
+
+        let listOut = build([.listItem(level: 0, ordered: false, spans: [span("Item")], rtl: true)])
+        let listStyle = listOut.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle
+        XCTAssertEqual(listStyle?.baseWritingDirection, .rightToLeft)
+    }
+
+    /// A run-level `Span.rtl` (docx `w:rPr/w:rtl` on a phrase embedded in the opposite-direction
+    /// paragraph) becomes TextKit's own run-level `.writingDirection` embedding override — distinct
+    /// from, and independent of, the paragraph's base direction.
+    func testRTLSpanCarriesRunLevelWritingDirectionAttribute() {
+        var rtlSpan = span("embedded"); rtlSpan.rtl = true
+        let out = build([.paragraph(spans: [span("plain "), rtlSpan])])
+        let text = out.string as NSString
+        let embeddedRange = text.range(of: "embedded")
+        XCTAssertNil(out.attribute(.writingDirection, at: 0, effectiveRange: nil), "the plain span must carry no override")
+        let direction = out.attribute(.writingDirection, at: embeddedRange.location, effectiveRange: nil) as? [Int]
+        XCTAssertEqual(direction, [NSWritingDirection.rightToLeft.rawValue | NSWritingDirectionFormatType.embedding.rawValue])
+    }
+
+    /// docx's `w:bidi` and odt's `style:writing-mode="rl-tb"` must agree once both readers hand
+    /// their `rtl: true` block to the SAME builder — this is the cross-format-agreement guard
+    /// `testOfficeAndMarkdownTablesWithSameContentProduceStructurallyEquivalentBlocks` already uses
+    /// for tables, applied to writing direction.
+    func testDocxAndOdtSourcedRTLBlocksProduceIdenticalBaseWritingDirection() {
+        let docxOut = build([.paragraph(spans: [span("text")], rtl: true)])
+        let odtOut = build([.paragraph(spans: [span("text")], rtl: true)])
+        let docxStyle = docxOut.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle
+        let odtStyle = odtOut.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle
+        XCTAssertEqual(docxStyle?.baseWritingDirection, odtStyle?.baseWritingDirection)
+    }
+
+    /// THE REGRESSION GUARD this sprint's brief demands: an LTR document's produced
+    /// `NSAttributedString` is IDENTICAL — not just "close" — to what it was before `rtl` existed.
+    /// `NSTextTableBlock` (inside `.table`) is not itself value-equal under `isEqual`, so this
+    /// compares the STRING plus every base-writing-direction (the one thing this sprint could have
+    /// disturbed) across two independently-built copies of the same non-trivial blocks — headings,
+    /// lists, tables, mixed spans — asserted by comparison, never by eyeball.
+    func testLTRDocumentProducesTheSameStringAndBaseWritingDirectionAcrossEveryBlockKind() {
+        let blocks: [OfficeBlock] = [
+            .heading(level: 1, spans: [span("Title", bold: true)]),
+            .paragraph(spans: [span("plain "), span("bold", bold: true), span(" tail")]),
+            .listItem(level: 0, ordered: true, spans: [span("One")]),
+            .listItem(level: 1, ordered: false, spans: [span("Nested")]),
+            .table(rows: [[Cell(spans: [span("A")]), Cell(spans: [span("B")])]], headerRows: 1),
+        ]
+        let a = build(blocks)
+        let b = build(blocks)
+        XCTAssertEqual(a.string, b.string)
+        func directions(_ out: NSAttributedString) -> [NSWritingDirection] {
+            var seen: [NSWritingDirection] = []
+            out.enumerateAttribute(.paragraphStyle, in: NSRange(location: 0, length: out.length)) { value, _, _ in
+                guard let style = value as? NSParagraphStyle else { return }
+                seen.append(style.baseWritingDirection)
+            }
+            return seen
+        }
+        let directionsA = directions(a)
+        XCTAssertEqual(directionsA, directions(b))
+        XCTAssertTrue(directionsA.allSatisfy { $0 == .natural }, "no LTR block may pick up an explicit direction")
+    }
+
     /// A linked office span must carry the identical `.foregroundColor`/`.underlineStyle`/`.link`
     /// treatment a markdown link gets — a reader shouldn't be able to tell which format a link
     /// came from just by looking at it.

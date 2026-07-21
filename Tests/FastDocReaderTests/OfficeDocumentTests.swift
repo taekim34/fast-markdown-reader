@@ -158,6 +158,19 @@ final class OfficeDocumentTests: XCTestCase {
         return buildZip([("word/document.xml", Data(document.utf8))])
     }
 
+    /// S12 invariant 29: an RTL-marked paragraph must reach the RENDERED text storage's
+    /// `NSParagraphStyle.baseWritingDirection` through the real `MarkdownDocument.read` dispatch —
+    /// a parser-only test (`DocxReaderTests`) proves `OfficeBlock.paragraph`'s `rtl` field, not that
+    /// it actually reaches `OfficeTextBuilder.build`'s output through this document's own pipeline.
+    private func fixtureDocxWithBidiParagraph() -> Data {
+        let document = """
+        <?xml version="1.0" encoding="UTF-8"?><w:document><w:body>
+          <w:p><w:pPr><w:bidi/></w:pPr><w:r><w:t>\u{0645}\u{0631}\u{062D}\u{0628}\u{0627}</w:t></w:r></w:p>
+        </w:body></w:document>
+        """
+        return buildZip([("word/document.xml", Data(document.utf8))])
+    }
+
     private func fixtureOdtWithTableImage() -> Data {
         let content = """
         <?xml version="1.0" encoding="UTF-8"?>
@@ -267,6 +280,19 @@ final class OfficeDocumentTests: XCTestCase {
         XCTAssertEqual(found.count, 1)
         XCTAssertEqual(found.first?.engine, .math)
         XCTAssertEqual(found.first?.code, "x^2")
+    }
+
+    /// S12 invariant 29: the RTL-marked block reaches the rendered document's OWN paragraph style,
+    /// not just `DocxReader`'s parsed output.
+    func testRTLParagraphReachesRenderedDocumentThroughTheFullReadPath() throws {
+        let (doc, wc) = try openOffice(fixtureDocxWithBidiParagraph())
+        XCTAssertTrue(doc.officeBlocks.contains {
+            if case .paragraph(_, let rtl) = $0 { return rtl }
+            return false
+        })
+        let storage = try XCTUnwrap(wc.textStorageRef)
+        let style = storage.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle
+        XCTAssertEqual(style?.baseWritingDirection, .rightToLeft)
     }
 
     func testMalformedArchiveThrowsRatherThanProducingAnEmptyDocument() {

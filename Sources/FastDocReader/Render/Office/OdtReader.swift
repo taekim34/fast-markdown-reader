@@ -47,10 +47,12 @@ enum OdtReader {
         var listStyles: [String: [Int: Bool]] = [:]
         var textStyles: [String: TextStyle] = [:]
         var paragraphOutlineLevels: [String: Int] = [:]
+        var paragraphDirections: [String: Bool] = [:]
         for root in styleRoots.reversed() {
             listStyles.merge(parseListStyles(from: root)) { existing, _ in existing }
             textStyles.merge(parseTextStyles(from: root)) { existing, _ in existing }
             paragraphOutlineLevels.merge(parseParagraphOutlineLevels(from: root)) { existing, _ in existing }
+            paragraphDirections.merge(parseParagraphWritingModes(from: root)) { existing, _ in existing }
         }
         guard let body = contentRoot.firstDescendant("office:text") else { return [] }
         // ODF footnotes AND endnotes are the SAME element (`text:note`, told apart only by
@@ -66,10 +68,10 @@ enum OdtReader {
         let notes = NoteCollector()
         let bodyBlocks = parseBody(
             body, listStyles: listStyles, textStyles: textStyles, paragraphOutlineLevels: paragraphOutlineLevels,
-            archive: archive, notes: notes)
+            paragraphDirections: paragraphDirections, archive: archive, notes: notes)
         let noteBlocks = buildNoteBlocks(
             notes.entries, listStyles: listStyles, textStyles: textStyles, paragraphOutlineLevels: paragraphOutlineLevels,
-            archive: archive)
+            paragraphDirections: paragraphDirections, archive: archive)
         return bodyBlocks + noteBlocks
     }
 
@@ -106,7 +108,8 @@ enum OdtReader {
     /// EXTRACTION differs per format, only the output shape is one-to-one).
     private static func buildNoteBlocks(
         _ noteEntries: [(marker: String, body: XMLNode)], listStyles: [String: [Int: Bool]],
-        textStyles: [String: TextStyle], paragraphOutlineLevels: [String: Int], archive: ZipArchive
+        textStyles: [String: TextStyle], paragraphOutlineLevels: [String: Int], paragraphDirections: [String: Bool],
+        archive: ZipArchive
     ) -> [OfficeBlock] {
         noteEntries.flatMap { entry -> [OfficeBlock] in
             // A footnote/endnote body cannot itself contain another `text:note` in any real
@@ -115,7 +118,7 @@ enum OdtReader {
             // back into the outer one.
             var blocks = parseBody(
                 entry.body, listStyles: listStyles, textStyles: textStyles, paragraphOutlineLevels: paragraphOutlineLevels,
-                archive: archive, notes: NoteCollector())
+                paragraphDirections: paragraphDirections, archive: archive, notes: NoteCollector())
             let marker = Span(text: entry.marker, superscript: true)
             if let first = blocks.first, let markedFirst = prependingMarker(marker, to: first) {
                 blocks[0] = markedFirst
@@ -144,10 +147,13 @@ enum OdtReader {
     /// `nil` for `.table`/`.image` — there is no `[Span]` inside either to prepend into.
     private static func prependingMarker(_ marker: Span, to block: OfficeBlock) -> OfficeBlock? {
         switch block {
-        case .paragraph(let spans): return .paragraph(spans: [marker, noteMarkerSeparator] + spans)
-        case .heading(let level, let spans): return .heading(level: level, spans: [marker, noteMarkerSeparator] + spans)
-        case .listItem(let level, let ordered, let spans, let itemMarker):
-            return .listItem(level: level, ordered: ordered, spans: [marker, noteMarkerSeparator] + spans, marker: itemMarker)
+        case .paragraph(let spans, let rtl):
+            return .paragraph(spans: [marker, noteMarkerSeparator] + spans, rtl: rtl)
+        case .heading(let level, let spans, let rtl):
+            return .heading(level: level, spans: [marker, noteMarkerSeparator] + spans, rtl: rtl)
+        case .listItem(let level, let ordered, let spans, let itemMarker, let rtl):
+            return .listItem(level: level, ordered: ordered, spans: [marker, noteMarkerSeparator] + spans,
+                              marker: itemMarker, rtl: rtl)
         case .table, .image, .unsupportedGraphic, .formula: return nil
         }
     }
@@ -252,6 +258,24 @@ enum OdtReader {
         return map
     }
 
+    /// A paragraph style's `style:paragraph-properties/@style:writing-mode` — the ODF equivalent of
+    /// docx's `w:pPr/w:bidi` — mapped the same "only what's found, only from a paragraph-family
+    /// style" way `parseParagraphOutlineLevels` reads `style:default-outline-level`. Only the
+    /// literal value `"rl-tb"` (right-to-left, top-to-bottom — the value Writer's own "right-to-left"
+    /// toggle produces) is treated as RTL; every other value (`lr-tb`, `tb-rl`, `page`, …) and an
+    /// absent attribute both mean "not explicitly marked" — this reader reads the file's own say-so,
+    /// never guesses from content the way TextKit's UNMARKED fallback already does on its own.
+    private static func parseParagraphWritingModes(from root: XMLNode) -> [String: Bool] {
+        var map: [String: Bool] = [:]
+        for styleNode in root.allDescendants("style:style") where styleNode.attributes["style:family"] == "paragraph" {
+            guard let name = styleNode.attributes["style:name"],
+                  let mode = styleNode.child("style:paragraph-properties")?.attributes["style:writing-mode"]
+            else { continue }
+            map[name] = mode == "rl-tb"
+        }
+        return map
+    }
+
     // MARK: content.xml — office:text → blocks
 
     /// Guards `parseBody`'s generic recursion (see the `default` case below) against a hostile
@@ -261,7 +285,8 @@ enum OdtReader {
 
     private static func parseBody(
         _ text: XMLNode, listStyles: [String: [Int: Bool]], textStyles: [String: TextStyle],
-        paragraphOutlineLevels: [String: Int], archive: ZipArchive, notes: NoteCollector, depth: Int = 0
+        paragraphOutlineLevels: [String: Int], paragraphDirections: [String: Bool], archive: ZipArchive,
+        notes: NoteCollector, depth: Int = 0
     ) -> [OfficeBlock] {
         var blocks: [OfficeBlock] = []
         for child in text.children {
@@ -269,21 +294,24 @@ enum OdtReader {
             case "text:h":
                 let rawLevel = Int(child.attributes["text:outline-level"] ?? "") ?? 1
                 let level = min(max(rawLevel, 1), 6)
+                let rtl = child.attributes["text:style-name"].flatMap { paragraphDirections[$0] } ?? false
                 blocks.append(contentsOf: paragraphLikeBlocks(
-                    child, make: { .heading(level: level, spans: $0) }, textStyles: textStyles, archive: archive,
+                    child, make: { .heading(level: level, spans: $0, rtl: rtl) }, textStyles: textStyles, archive: archive,
                     notes: notes))
             case "text:p":
                 // A `text:p` whose OWN paragraph style declares `style:default-outline-level` is a
                 // heading too — Writer produces this shape routinely — resolved on the same 1-based
                 // scale `text:outline-level` already uses, so it's clamped identically.
-                if let styleName = child.attributes["text:style-name"], let rawLevel = paragraphOutlineLevels[styleName] {
+                let styleName = child.attributes["text:style-name"]
+                let rtl = styleName.flatMap { paragraphDirections[$0] } ?? false
+                if let styleName, let rawLevel = paragraphOutlineLevels[styleName] {
                     let level = min(max(rawLevel, 1), 6)
                     blocks.append(contentsOf: paragraphLikeBlocks(
-                        child, make: { .heading(level: level, spans: $0) }, textStyles: textStyles, archive: archive,
+                        child, make: { .heading(level: level, spans: $0, rtl: rtl) }, textStyles: textStyles, archive: archive,
                         notes: notes))
                 } else {
                     blocks.append(contentsOf: paragraphLikeBlocks(
-                        child, make: { .paragraph(spans: $0) }, textStyles: textStyles, archive: archive, notes: notes))
+                        child, make: { .paragraph(spans: $0, rtl: rtl) }, textStyles: textStyles, archive: archive, notes: notes))
                 }
             case "text:hidden-paragraph":
                 // Verified against OASIS ODF 1.3 schema (element text:hidden-paragraph):
@@ -298,8 +326,9 @@ enum OdtReader {
                 // SHOWS the content, per this project's governing rule that losing the author's
                 // words is the unforgivable failure, an unknown state is not grounds to hide.
                 if child.attributes["text:is-hidden"] != "true" {
+                    let rtl = child.attributes["text:style-name"].flatMap { paragraphDirections[$0] } ?? false
                     blocks.append(contentsOf: paragraphLikeBlocks(
-                        child, make: { .paragraph(spans: $0) }, textStyles: textStyles, archive: archive,
+                        child, make: { .paragraph(spans: $0, rtl: rtl) }, textStyles: textStyles, archive: archive,
                         notes: notes))
                 }
             case "text:numbered-paragraph":
@@ -314,18 +343,23 @@ enum OdtReader {
                 let level = max(rawLevel - 1, 0)
                 let ordered = isOrdered(styleName: styleName, level: level, listStyles: listStyles)
                 for item in child.children where item.name == "text:p" {
+                    // The item's OWN `text:p` style-name (paragraph formatting), not the enclosing
+                    // `text:numbered-paragraph`'s (which names its LIST style, a different lookup
+                    // table entirely).
+                    let rtl = item.attributes["text:style-name"].flatMap { paragraphDirections[$0] } ?? false
                     blocks.append(contentsOf: paragraphLikeBlocks(
-                        item, make: { .listItem(level: level, ordered: ordered, spans: $0) }, textStyles: textStyles,
+                        item, make: { .listItem(level: level, ordered: ordered, spans: $0, rtl: rtl) }, textStyles: textStyles,
                         archive: archive, notes: notes))
                 }
             case "text:list":
                 blocks.append(contentsOf: parseList(
                     child, level: 0, inheritedStyleName: nil, listStyles: listStyles, textStyles: textStyles,
-                    archive: archive, notes: notes))
+                    paragraphDirections: paragraphDirections, archive: archive, notes: notes))
             case "table:table":
                 blocks.append(parseTable(
                     child, listStyles: listStyles, textStyles: textStyles,
-                    paragraphOutlineLevels: paragraphOutlineLevels, archive: archive, notes: notes))
+                    paragraphOutlineLevels: paragraphOutlineLevels, paragraphDirections: paragraphDirections,
+                    archive: archive, notes: notes))
             case "office:annotation", "text:tracked-changes", "text:sequence-decls", "text:variable-decls",
                  "text:user-field-decls", "office:forms", "office:scripts":
                 // Deliberate exclusions — dropped ON PURPOSE, not by omission (see the permissive
@@ -357,7 +391,8 @@ enum OdtReader {
                 guard depth < maxBodyRecursionDepth else { continue }
                 blocks.append(contentsOf: parseBody(
                     child, listStyles: listStyles, textStyles: textStyles,
-                    paragraphOutlineLevels: paragraphOutlineLevels, archive: archive, notes: notes, depth: depth + 1))
+                    paragraphOutlineLevels: paragraphOutlineLevels, paragraphDirections: paragraphDirections,
+                    archive: archive, notes: notes, depth: depth + 1))
             }
         }
         return blocks
@@ -393,7 +428,7 @@ enum OdtReader {
     /// because the inner element omitted a redundant attribute.
     private static func parseList(
         _ list: XMLNode, level: Int, inheritedStyleName: String?, listStyles: [String: [Int: Bool]],
-        textStyles: [String: TextStyle], archive: ZipArchive, notes: NoteCollector
+        textStyles: [String: TextStyle], paragraphDirections: [String: Bool], archive: ZipArchive, notes: NoteCollector
     ) -> [OfficeBlock] {
         let styleName = list.attributes["text:style-name"] ?? inheritedStyleName
         let ordered = isOrdered(styleName: styleName, level: level, listStyles: listStyles)
@@ -402,13 +437,16 @@ enum OdtReader {
             for child in item.children {
                 switch child.name {
                 case "text:p":
+                    // The item's OWN paragraph style-name, not the enclosing LIST's — same
+                    // distinction `text:numbered-paragraph` above draws.
+                    let rtl = child.attributes["text:style-name"].flatMap { paragraphDirections[$0] } ?? false
                     blocks.append(contentsOf: paragraphLikeBlocks(
-                        child, make: { .listItem(level: level, ordered: ordered, spans: $0) },
+                        child, make: { .listItem(level: level, ordered: ordered, spans: $0, rtl: rtl) },
                         textStyles: textStyles, archive: archive, notes: notes))
                 case "text:list":
                     blocks.append(contentsOf: parseList(
                         child, level: level + 1, inheritedStyleName: styleName, listStyles: listStyles,
-                        textStyles: textStyles, archive: archive, notes: notes))
+                        textStyles: textStyles, paragraphDirections: paragraphDirections, archive: archive, notes: notes))
                 default:
                     continue
                 }
@@ -425,7 +463,8 @@ enum OdtReader {
     /// table is a faithful rendering, a wrongly-bolded row is not).
     private static func parseTable(
         _ table: XMLNode, listStyles: [String: [Int: Bool]], textStyles: [String: TextStyle],
-        paragraphOutlineLevels: [String: Int], archive: ZipArchive, notes: NoteCollector
+        paragraphOutlineLevels: [String: Int], paragraphDirections: [String: Bool], archive: ZipArchive,
+        notes: NoteCollector
     ) -> OfficeBlock {
         var rows: [[Cell]] = []
         var headerRows = 0
@@ -435,13 +474,15 @@ enum OdtReader {
                 let expanded = child.children.filter { $0.name == "table:table-row" }
                     .flatMap { expandRow(
                         $0, listStyles: listStyles, textStyles: textStyles,
-                        paragraphOutlineLevels: paragraphOutlineLevels, archive: archive, notes: notes) }
+                        paragraphOutlineLevels: paragraphOutlineLevels, paragraphDirections: paragraphDirections,
+                        archive: archive, notes: notes) }
                 headerRows += expanded.count
                 rows.append(contentsOf: expanded)
             case "table:table-row":
                 rows.append(contentsOf: expandRow(
                     child, listStyles: listStyles, textStyles: textStyles,
-                    paragraphOutlineLevels: paragraphOutlineLevels, archive: archive, notes: notes))
+                    paragraphOutlineLevels: paragraphOutlineLevels, paragraphDirections: paragraphDirections,
+                    archive: archive, notes: notes))
             default:
                 continue
             }
@@ -463,14 +504,15 @@ enum OdtReader {
     /// is exactly `OfficeBlock.table`'s anchor-only shape, spans/repeats notwithstanding.
     private static func expandRow(
         _ row: XMLNode, listStyles: [String: [Int: Bool]], textStyles: [String: TextStyle],
-        paragraphOutlineLevels: [String: Int], archive: ZipArchive, notes: NoteCollector
+        paragraphOutlineLevels: [String: Int], paragraphDirections: [String: Bool], archive: ZipArchive,
+        notes: NoteCollector
     ) -> [[Cell]] {
         let rowRepeat = Int(row.attributes["table:number-rows-repeated"] ?? "") ?? 1
         var cells: [Cell] = []
         for cell in row.children where cell.name == "table:table-cell" {
             let blocks = collectCellBlocks(
                 cell, listStyles: listStyles, textStyles: textStyles, paragraphOutlineLevels: paragraphOutlineLevels,
-                archive: archive, notes: notes)
+                paragraphDirections: paragraphDirections, archive: archive, notes: notes)
             let rowSpan = Int(cell.attributes["table:number-rows-spanned"] ?? "") ?? 1
             let colSpan = Int(cell.attributes["table:number-columns-spanned"] ?? "") ?? 1
             let colRepeat = Int(cell.attributes["table:number-columns-repeated"] ?? "") ?? 1
@@ -488,7 +530,7 @@ enum OdtReader {
     /// always passes through. Mirrors `DocxReader.isEmptyTextBlock` exactly.
     private static func isEmptyTextBlock(_ block: OfficeBlock) -> Bool {
         switch block {
-        case .paragraph(let spans), .heading(_, let spans), .listItem(_, _, let spans, _):
+        case .paragraph(let spans, _), .heading(_, let spans, _), .listItem(_, _, let spans, _, _):
             return spans.isEmpty
         case .table, .image, .unsupportedGraphic, .formula:
             return false
@@ -517,7 +559,8 @@ enum OdtReader {
     /// phantom `.paragraph(spans: [])` standing in for "nothing here".
     private static func collectCellBlocks(
         _ cell: XMLNode, listStyles: [String: [Int: Bool]], textStyles: [String: TextStyle],
-        paragraphOutlineLevels: [String: Int], archive: ZipArchive, notes: NoteCollector
+        paragraphOutlineLevels: [String: Int], paragraphDirections: [String: Bool], archive: ZipArchive,
+        notes: NoteCollector
     ) -> [OfficeBlock] {
         var blocks: [OfficeBlock] = []
         for child in cell.children {
@@ -525,23 +568,26 @@ enum OdtReader {
             case "text:h":
                 let rawLevel = Int(child.attributes["text:outline-level"] ?? "") ?? 1
                 let level = min(max(rawLevel, 1), 6)
+                let rtl = child.attributes["text:style-name"].flatMap { paragraphDirections[$0] } ?? false
                 blocks.append(contentsOf: paragraphLikeBlocks(
-                    child, make: { .heading(level: level, spans: $0) }, textStyles: textStyles, archive: archive,
+                    child, make: { .heading(level: level, spans: $0, rtl: rtl) }, textStyles: textStyles, archive: archive,
                     notes: notes))
             case "text:p":
-                if let styleName = child.attributes["text:style-name"], let rawLevel = paragraphOutlineLevels[styleName] {
+                let styleName = child.attributes["text:style-name"]
+                let rtl = styleName.flatMap { paragraphDirections[$0] } ?? false
+                if let styleName, let rawLevel = paragraphOutlineLevels[styleName] {
                     let level = min(max(rawLevel, 1), 6)
                     blocks.append(contentsOf: paragraphLikeBlocks(
-                        child, make: { .heading(level: level, spans: $0) }, textStyles: textStyles, archive: archive,
+                        child, make: { .heading(level: level, spans: $0, rtl: rtl) }, textStyles: textStyles, archive: archive,
                         notes: notes))
                 } else {
                     blocks.append(contentsOf: paragraphLikeBlocks(
-                        child, make: { .paragraph(spans: $0) }, textStyles: textStyles, archive: archive, notes: notes))
+                        child, make: { .paragraph(spans: $0, rtl: rtl) }, textStyles: textStyles, archive: archive, notes: notes))
                 }
             case "text:list":
                 blocks.append(contentsOf: parseList(
                     child, level: 0, inheritedStyleName: nil, listStyles: listStyles, textStyles: textStyles,
-                    archive: archive, notes: notes))
+                    paragraphDirections: paragraphDirections, archive: archive, notes: notes))
             case "table:table":
                 let spans = flattenNestedTable(child, textStyles: textStyles, notes: notes)
                 if !spans.isEmpty { blocks.append(.paragraph(spans: spans)) }

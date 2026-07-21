@@ -179,10 +179,10 @@ enum DocxReader {
     /// caller falls back to a standalone marker paragraph instead.
     private static func prependingMarker(_ marker: Span, to block: OfficeBlock) -> OfficeBlock? {
         switch block {
-        case .paragraph(let spans): return .paragraph(spans: [marker] + spans)
-        case .heading(let level, let spans): return .heading(level: level, spans: [marker] + spans)
-        case .listItem(let level, let ordered, let spans, let itemMarker):
-            return .listItem(level: level, ordered: ordered, spans: [marker] + spans, marker: itemMarker)
+        case .paragraph(let spans, let rtl): return .paragraph(spans: [marker] + spans, rtl: rtl)
+        case .heading(let level, let spans, let rtl): return .heading(level: level, spans: [marker] + spans, rtl: rtl)
+        case .listItem(let level, let ordered, let spans, let itemMarker, let rtl):
+            return .listItem(level: level, ordered: ordered, spans: [marker] + spans, marker: itemMarker, rtl: rtl)
         case .table, .image, .unsupportedGraphic, .formula: return nil
         }
     }
@@ -718,7 +718,7 @@ enum DocxReader {
     /// table block is never "empty" in this sense and always passes through.
     private static func isEmptyTextBlock(_ block: OfficeBlock) -> Bool {
         switch block {
-        case .paragraph(let spans), .heading(_, let spans), .listItem(_, _, let spans, _):
+        case .paragraph(let spans, _), .heading(_, let spans, _), .listItem(_, _, let spans, _, _):
             return spans.isEmpty
         case .table, .image, .unsupportedGraphic, .formula:
             return false
@@ -976,6 +976,12 @@ enum DocxReader {
         notes: NoteNumbering, listState: ListNumberingState
     ) -> [OfficeBlock] {
         let pPr = p.child("w:pPr")
+        // Read directly off THIS paragraph's own `w:pPr` — not resolved through the `w:basedOn`
+        // style chain `resolvedOutlineLevel` walks for headings. Word's RTL-paragraph toggle writes
+        // `w:bidi` onto the paragraph itself when applied from the UI; a style-level default that
+        // ALSO needs the basedOn chain to reach it is a real possibility this reader doesn't yet
+        // resolve — narrower than "wrong", but worth stating rather than silently assuming.
+        let rtl = isOn(pPr, "w:bidi")
         let spans = collectSpans(in: p, relationships: relationships, notes: notes)
         let drawingBlocks = collectDrawingBlocks(
             in: p, styleInfo: styleInfo, numbering: numbering, relationships: relationships,
@@ -1003,7 +1009,7 @@ enum DocxReader {
         let textBlock: OfficeBlock?
         let skipEmptyText = spans.isEmpty && (!drawingBlocks.isEmpty || !formulaBlocks.isEmpty)
         if let level = headingLevel(pPr: pPr, pStyleId: pStyleId, styleInfo: styleInfo) {
-            textBlock = skipEmptyText ? nil : .heading(level: level, spans: spans)
+            textBlock = skipEmptyText ? nil : .heading(level: level, spans: spans, rtl: rtl)
         } else if let numPr = pPr?.child("w:numPr") {
             let ilvl = Int(numPr.child("w:ilvl")?.attributes["w:val"] ?? "") ?? 0
             let numId = numPr.child("w:numId")?.attributes["w:val"]
@@ -1012,12 +1018,12 @@ enum DocxReader {
             // never a list item.
             if let info = numberedListInfo(numId: numId, ilvl: ilvl, info: numbering, state: listState) {
                 textBlock = skipEmptyText ? nil
-                    : .listItem(level: ilvl, ordered: info.ordered, spans: spans, marker: info.marker)
+                    : .listItem(level: ilvl, ordered: info.ordered, spans: spans, marker: info.marker, rtl: rtl)
             } else {
-                textBlock = skipEmptyText ? nil : .paragraph(spans: spans)
+                textBlock = skipEmptyText ? nil : .paragraph(spans: spans, rtl: rtl)
             }
         } else {
-            textBlock = skipEmptyText ? nil : .paragraph(spans: spans)
+            textBlock = skipEmptyText ? nil : .paragraph(spans: spans, rtl: rtl)
         }
         var blocks: [OfficeBlock] = []
         if let textBlock { blocks.append(textBlock) }
@@ -1289,7 +1295,7 @@ enum DocxReader {
             if let last = spans.last, last.bookmarks.isEmpty, last.bold == span.bold, last.italic == span.italic,
                last.underline == span.underline, last.code == span.code, last.link == span.link,
                last.strikethrough == span.strikethrough, last.superscript == span.superscript,
-               last.subscripted == span.subscripted {
+               last.subscripted == span.subscripted, last.rtl == span.rtl {
                 spans[spans.count - 1].text += span.text
             } else {
                 spans.append(span)
@@ -1488,7 +1494,7 @@ enum DocxReader {
         return Span(
             text: text, bold: isOn(rPr, "w:b"), italic: isOn(rPr, "w:i"), underline: isOn(rPr, "w:u"),
             strikethrough: isOn(rPr, "w:strike"), superscript: vertAlign == "superscript",
-            subscripted: vertAlign == "subscript")
+            subscripted: vertAlign == "subscript", rtl: isOn(rPr, "w:rtl"))
     }
 
     /// A run-property toggle (`w:b`/`w:i`/`w:u`) is ON by its mere presence — UNLESS it carries
