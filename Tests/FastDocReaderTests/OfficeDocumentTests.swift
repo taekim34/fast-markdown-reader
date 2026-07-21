@@ -287,7 +287,7 @@ final class OfficeDocumentTests: XCTestCase {
     func testRTLParagraphReachesRenderedDocumentThroughTheFullReadPath() throws {
         let (doc, wc) = try openOffice(fixtureDocxWithBidiParagraph())
         XCTAssertTrue(doc.officeBlocks.contains {
-            if case .paragraph(_, let rtl) = $0 { return rtl }
+            if case .paragraph(_, let rtl, _, _) = $0 { return rtl }
             return false
         })
         let storage = try XCTUnwrap(wc.textStorageRef)
@@ -351,6 +351,42 @@ final class OfficeDocumentTests: XCTestCase {
         let fontLarge = try XCTUnwrap(large.attribute(.font, at: 0, effectiveRange: nil) as? NSFont)
         XCTAssertGreaterThan(fontLarge.pointSize, fontSmall.pointSize,
                              "a font-size change must re-run OfficeTextBuilder.build, not redraw a cached string")
+    }
+
+    /// S13 invariant 29: `MarkdownDocument`'s own `render(into:)` is the ONE place that knows the
+    /// document's `officeDefaultBodyFontSize` (set via `setOfficeContent`) and the user's
+    /// `FontSizeStore` size both exist and must be combined — `OfficeTextBuilderTests` proves the
+    /// SCALING MATH in isolation, but not that `MarkdownDocument` actually wires its own stored
+    /// `documentDefaultFontSize` into that call, which is exactly the kind of seam a parser-only or
+    /// builder-only test cannot see (no reader sets this field yet, so this drives the document
+    /// directly via `setOfficeContent`, the same seam `OfficeImageLoadingTests` uses for images).
+    func testDocumentDefaultBodyFontSizeReachesTheRenderedTextThroughMarkdownDocumentsOwnRenderPath() throws {
+        var body = Span(text: "Body"); body.fontSize = 11
+        let blocks: [OfficeBlock] = [.paragraph(spans: [body])]
+        let archive = try ZipArchive(data: buildZip([("word/document.xml", Data())]))
+
+        let userSize: CGFloat = 22 // FontSizeStore.size stand-in, applied via RenderTheme.current below
+        let originalSize = FontSizeStore.size
+        FontSizeStore.size = userSize
+        defer { FontSizeStore.size = originalSize }
+
+        let doc = MarkdownDocument()
+        doc.fileURL = URL(fileURLWithPath: "/tmp/fmd-office-fontsize-fixture-\(UUID().uuidString).docx")
+        // documentDefaultFontSize: 11 → scale == userSize/11 == 2, so the 11pt authored run must
+        // render at exactly 22pt — a value that could ONLY come from `render(into:)` actually
+        // passing `officeDefaultBodyFontSize` through, not from `OfficeTextBuilder.build`'s own
+        // 11pt fallback default (which would produce the SAME 22pt here by coincidence at this
+        // particular size — so this also asserts against a DIFFERENT default, 8pt, below, where the
+        // two would diverge if the real value weren't actually wired through).
+        doc.setOfficeContent(blocks: blocks, archive: archive, defaultBodyFontSize: 8)
+        doc.makeWindowControllers()
+        let wc = try XCTUnwrap(doc.windowControllers.first as? DocumentWindowController)
+        wc.window?.setFrame(NSRect(x: 0, y: 0, width: 800, height: 600), display: false)
+        let storage = try XCTUnwrap(wc.textStorageRef)
+        let font = try XCTUnwrap(storage.attribute(.font, at: 0, effectiveRange: nil) as? NSFont)
+        // scale = 22/8 = 2.75; 11 * 2.75 = 30.25 → rounds to 30.
+        XCTAssertEqual(font.pointSize, 30,
+                       "render(into:) must use the DOCUMENT's own default (8), not OfficeTextBuilder's 11pt fallback")
     }
 
     // MARK: Read-only enforcement

@@ -234,7 +234,7 @@ final class OdtReaderTests: XCTestCase {
             </style:style>
             <style:style style:name="B" style:family="text"><style:text-properties fo:font-weight="bold"/></style:style>
             """)
-        guard case .paragraph(let spans, let rtl) = blocks[0] else { return XCTFail("expected a paragraph") }
+        guard case .paragraph(let spans, let rtl, _, _) = blocks[0] else { return XCTFail("expected a paragraph") }
         XCTAssertTrue(rtl)
         XCTAssertTrue(spans.allSatisfy { !$0.rtl })
     }
@@ -244,7 +244,7 @@ final class OdtReaderTests: XCTestCase {
     func testDocumentWithNoWritingModeMarkupProducesRtlFalseEverywhere() throws {
         let blocks = try read(body: "<text:p>Ordinary</text:p>")
         XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Ordinary")])])
-        guard case .paragraph(_, let rtl) = blocks[0] else { return XCTFail("expected a paragraph") }
+        guard case .paragraph(_, let rtl, _, _) = blocks[0] else { return XCTFail("expected a paragraph") }
         XCTAssertFalse(rtl)
     }
 
@@ -542,7 +542,7 @@ final class OdtReaderTests: XCTestCase {
         // `Cell` holds `blocks`, not `spans`, since S7 — the reader still flattens a nested table
         // into a single `.paragraph` at parse time, so pull its spans back out for this assertion.
         let allText = rows.flatMap { $0 }.flatMap { $0.blocks }.flatMap { block -> [Span] in
-            if case .paragraph(let spans, _) = block { return spans }
+            if case .paragraph(let spans, _, _, _) = block { return spans }
             return []
         }.map(\.text).joined()
         XCTAssertTrue(allText.contains("Outer"), "outer paragraph text must survive")
@@ -745,7 +745,7 @@ final class OdtReaderTests: XCTestCase {
           <text:note-body><text:p>Note body text.</text:p></text:note-body>
         </text:note> note.</text:p>
         """)
-        guard case .paragraph(let citingSpans, _) = blocks[0] else { return XCTFail("expected a paragraph") }
+        guard case .paragraph(let citingSpans, _, _, _) = blocks[0] else { return XCTFail("expected a paragraph") }
         XCTAssertFalse(citingSpans.contains { $0.text.contains("Note body text.") })
     }
 
@@ -763,7 +763,7 @@ final class OdtReaderTests: XCTestCase {
           <text:note-body><text:p>The first note body text.</text:p></text:note-body>
         </text:note> note.</text:p>
         """)
-        guard case .paragraph(let noteSpans, _) = blocks[1] else { return XCTFail("expected the appended note paragraph") }
+        guard case .paragraph(let noteSpans, _, _, _) = blocks[1] else { return XCTFail("expected the appended note paragraph") }
         XCTAssertEqual(noteSpans.map(\.text).joined(), "1\tThe first note body text.")
     }
 
@@ -1077,7 +1077,7 @@ final class OdtReaderTests: XCTestCase {
         let blocks = try DocumentTypes.readOffice(archive, extension: "odt")
         let allText = blocks.flatMap { block -> [String] in
             switch block {
-            case .paragraph(let spans, _), .heading(_, let spans, _), .listItem(_, _, let spans, _, _): return spans.map(\.text)
+            case .paragraph(let spans, _, _, _), .heading(_, let spans, _, _, _), .listItem(_, _, let spans, _, _, _, _): return spans.map(\.text)
             case .table, .image, .unsupportedGraphic, .formula: return []
             }
         }.joined()

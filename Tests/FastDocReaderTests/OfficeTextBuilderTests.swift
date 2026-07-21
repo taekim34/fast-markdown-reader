@@ -6,8 +6,11 @@ final class OfficeTextBuilderTests: XCTestCase {
     private let theme = RenderTheme.current(size: 16)
 
     private func span(_ text: String, bold: Bool = false, italic: Bool = false,
-                       underline: Bool = false, code: Bool = false) -> Span {
-        Span(text: text, bold: bold, italic: italic, underline: underline, code: code)
+                       underline: Bool = false, code: Bool = false,
+                       textColor: NSColor? = nil, highlightColor: NSColor? = nil,
+                       fontName: String? = nil, fontSize: CGFloat? = nil) -> Span {
+        Span(text: text, bold: bold, italic: italic, underline: underline, code: code,
+             textColor: textColor, highlightColor: highlightColor, fontSize: fontSize, fontName: fontName)
     }
 
     private func build(_ blocks: [OfficeBlock]) -> NSAttributedString {
@@ -854,5 +857,308 @@ final class OfficeTextBuilderTests: XCTestCase {
         out.enumerateWebBlocks { block, _ in found.append(block) }
         XCTAssertEqual(found.count, 1)
         XCTAssertEqual(found.first?.code, "y=mx+b")
+    }
+
+    // MARK: S13 — regression: an unstyled document is untouched by this sprint
+
+    /// The brief's own required guard: leaving every new field at its default must produce EXACTLY
+    /// the string+attributes the pre-sprint builder produced — asserted by comparison
+    /// (`NSAttributedString.isEqual(to:)`), never by eyeball. Built two ways (implicit defaults vs
+    /// explicitly passing the same default values) precisely so a future accidental default change
+    /// on ONE side would be caught by the other. `.table` is covered separately just below —
+    /// `NSTextTableBlock` (inside a table's paragraph style) is not itself value-equal under
+    /// `isEqual` even when every property matches (the same reason
+    /// `testLTRDocumentProducesTheSameStringAndBaseWritingDirectionAcrossEveryBlockKind` above
+    /// compares table STRUCTURE rather than raw `isEqual`), so it would fail this comparison for a
+    /// reason that has nothing to do with this sprint.
+    func testDefaultNewFieldsProduceByteIdenticalOutputToExplicitlyPassingTheSameDefaults() {
+        let implicit = build([
+            .heading(level: 2, spans: [span("Title")]),
+            .paragraph(spans: [span("Body")]),
+            .listItem(level: 0, ordered: true, spans: [span("Item")]),
+        ])
+        let explicit = build([
+            .heading(level: 2, spans: [span("Title")], rtl: false, alignment: nil, tabStops: []),
+            .paragraph(spans: [span("Body")], rtl: false, alignment: nil, tabStops: []),
+            .listItem(level: 0, ordered: true, spans: [span("Item")], marker: nil, rtl: false, alignment: nil, tabStops: []),
+        ])
+        XCTAssertTrue(implicit.isEqual(to: explicit))
+    }
+
+    /// The `.table` half of the same guard, compared by STRUCTURE (as the file's own precedent
+    /// does) rather than raw `isEqual`.
+    func testDefaultCellFieldsProduceTheSameTableStructureAsThePreSprintConstructionPath() {
+        let implicit = build([.table(rows: [[Cell(spans: [span("A")])]], headerRows: 0)])
+        let explicit = build([.table(rows: [[Cell(blocks: [.paragraph(spans: [span("A")])], backgroundColor: nil,
+                                                   borderColor: nil, borderWidth: nil, width: nil)]], headerRows: 0)])
+        XCTAssertEqual(implicit.string, explicit.string)
+        let a = try! XCTUnwrap(tableBlocks(in: implicit).first)
+        let b = try! XCTUnwrap(tableBlocks(in: explicit).first)
+        XCTAssertNil(a.backgroundColor)
+        XCTAssertNil(b.backgroundColor)
+        XCTAssertEqual(a.borderColor(for: .minX), b.borderColor(for: .minX))
+        XCTAssertEqual(a.width(for: .border, edge: .minX), b.width(for: .border, edge: .minX))
+    }
+
+    // MARK: S13 — run colour vs the reading theme
+
+    /// Resolves `color` under a given appearance the way TextKit itself would when actually
+    /// drawing — `NSColor.dynamic` colours (see `RenderTheme`/`Palette`) only pick a concrete RGB
+    /// once asked inside a drawing context for a specific appearance.
+    private func rgb(_ color: NSColor, appearance: NSAppearance) -> (r: CGFloat, g: CGFloat, b: CGFloat) {
+        var result: (CGFloat, CGFloat, CGFloat) = (0, 0, 0)
+        appearance.performAsCurrentDrawingAppearance {
+            let d = color.usingColorSpace(.deviceRGB)!
+            result = (d.redComponent, d.greenComponent, d.blueComponent)
+        }
+        return result
+    }
+    private let lightAppearance = NSAppearance(named: .aqua)!
+    private let darkAppearance = NSAppearance(named: .darkAqua)!
+
+    /// The decision this sprint makes: a near-neutral authored colour (grayscale — almost always
+    /// literal black) is treated as ORDINARY ink, not a deliberate mark, and steps aside for the
+    /// theme's own text colour — the same colour an unset `textColor` gets. That is what keeps
+    /// "authored black" readable once the theme goes dark, instead of drawing literal black text on
+    /// a near-black background.
+    func testAuthoredNearBlackTextColorStepsAsideForTheThemeInBothAppearances() {
+        let authoredBlack = NSColor(srgbRed: 0, green: 0, blue: 0, alpha: 1)
+        let resolved = OfficeTextBuilder.resolvedTextColor(authoredBlack, theme: theme)
+        let light = rgb(resolved, appearance: lightAppearance)
+        let dark = rgb(resolved, appearance: darkAppearance)
+        let themeLight = rgb(theme.textColor, appearance: lightAppearance)
+        let themeDark = rgb(theme.textColor, appearance: darkAppearance)
+        XCTAssertEqual(light.r, themeLight.r, accuracy: 0.001)
+        XCTAssertEqual(light.g, themeLight.g, accuracy: 0.001)
+        XCTAssertEqual(dark.r, themeDark.r, accuracy: 0.001)
+        XCTAssertEqual(dark.g, themeDark.g, accuracy: 0.001)
+        XCTAssertNotEqual(light.r, dark.r, accuracy: 0.001,
+                          "sanity check: the theme's own ink must actually differ between the two appearances")
+    }
+
+    /// The other half of the same decision: a genuinely COLOURFUL authored run (high saturation —
+    /// a red warning, here) is a deliberate mark and is drawn exactly as authored, in EITHER
+    /// appearance — losing that would lose the meaning the colour exists to carry.
+    func testAuthoredSaturatedTextColorIsHonoredLiterallyInBothAppearances() {
+        let authoredRed = NSColor(srgbRed: 0.8, green: 0.1, blue: 0.1, alpha: 1)
+        let resolved = OfficeTextBuilder.resolvedTextColor(authoredRed, theme: theme)
+        let light = rgb(resolved, appearance: lightAppearance)
+        let dark = rgb(resolved, appearance: darkAppearance)
+        XCTAssertEqual(light.r, 0.8, accuracy: 0.01)
+        XCTAssertEqual(light.g, 0.1, accuracy: 0.01)
+        XCTAssertEqual(light.r, dark.r, accuracy: 0.001, "a literal colour must not adapt to the appearance")
+        XCTAssertEqual(light.g, dark.g, accuracy: 0.001)
+    }
+
+    /// End-to-end through the span pipeline (not just the resolver function directly): a `code`
+    /// span's colour is the theme's own inline-code accent regardless of any authored `textColor` —
+    /// the single consistent monospace look, never overridden per-run (see `Span.fontName`'s doc,
+    /// which the same reasoning applies to for colour).
+    func testAuthoredTextColorNeverOverridesTheInlineCodeAccentColor() {
+        let out = build([.paragraph(spans: [span("snippet", code: true, textColor: .systemRed)])])
+        let color = out.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor
+        XCTAssertEqual(color, theme.inlineCodeColor)
+    }
+
+    /// An unset `textColor` is untouched — the pre-sprint theme colour, exactly.
+    func testSpanWithNoTextColorUsesTheThemeColorUnchanged() {
+        let out = build([.paragraph(spans: [span("plain")])])
+        let color = out.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor
+        XCTAssertEqual(color, theme.textColor)
+    }
+
+    // MARK: S13 — highlight colour (always literal, never theme-adjusted)
+
+    func testHighlightColorAppliesAsBackgroundColorAttribute() {
+        let out = build([.paragraph(spans: [span("marked", highlightColor: .yellow)])])
+        let bg = out.attribute(.backgroundColor, at: 0, effectiveRange: nil) as? NSColor
+        XCTAssertEqual(bg, NSColor.yellow)
+    }
+
+    func testSpanWithNoHighlightColorHasNoBackgroundColorAttribute() {
+        let out = build([.paragraph(spans: [span("plain")])])
+        XCTAssertNil(out.attribute(.backgroundColor, at: 0, effectiveRange: nil))
+    }
+
+    // MARK: S13 — font family
+
+    func testAuthoredFontNameOverridesTheFamilyButNeverForACodeSpan() {
+        let out = build([.paragraph(spans: [
+            span("Named", fontName: "Helvetica"),
+            span("Coded", code: true, fontName: "Helvetica"),
+        ])])
+        let expectedFamily = NSFont(name: "Helvetica", size: theme.bodyFont.pointSize)!.familyName
+        let namedFont = out.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
+        XCTAssertEqual(namedFont?.familyName, expectedFamily)
+        let text = out.string as NSString
+        let codedRange = text.range(of: "Coded")
+        let codedFont = out.attribute(.font, at: codedRange.location, effectiveRange: nil) as? NSFont
+        XCTAssertEqual(codedFont?.fontName, theme.codeFont.fontName,
+                       "an authored family must never override the single, consistent inline-code look")
+    }
+
+    func testSpanWithNoFontNameUsesTheThemeFamilyUnchanged() {
+        let out = build([.paragraph(spans: [span("plain")])])
+        let font = out.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
+        XCTAssertEqual(font?.familyName, theme.bodyFont.familyName)
+    }
+
+    // MARK: S13 — the font-size model (authored size × user-size/document-default ratio)
+
+    /// The brief's own required case: a 22-half-point (11pt) body run and a 32-half-point (16pt)
+    /// run keep their AUTHORED ratio at any user reading size, and the reading size still sets the
+    /// overall scale — tested at two different reading sizes so neither half of that claim could be
+    /// satisfied by accident (a constant scale would pass the ratio check; a fixed size would fail
+    /// the "still governs overall scale" check).
+    func testAuthoredFontSizeKeepsItsRatioToTheDocumentDefaultAcrossTwoUserReadingSizes() {
+        func sizes(userSize: CGFloat) -> (body: CGFloat, heading: CGFloat) {
+            let out = OfficeTextBuilder.build([
+                .paragraph(spans: [span("Body", fontSize: 11)]),
+                .paragraph(spans: [span("Head", fontSize: 16)]),
+            ], theme: RenderTheme.current(size: userSize), documentDefaultFontSize: 11)
+            let bodyFont = out.attribute(.font, at: 0, effectiveRange: nil) as! NSFont
+            let headRange = (out.string as NSString).range(of: "Head")
+            let headFont = out.attribute(.font, at: headRange.location, effectiveRange: nil) as! NSFont
+            return (bodyFont.pointSize, headFont.pointSize)
+        }
+        let atTwentyTwo = sizes(userSize: 22)   // scale = 22/11 = 2
+        XCTAssertEqual(atTwentyTwo.body, 22)
+        XCTAssertEqual(atTwentyTwo.heading, 32)
+
+        let atFortyFour = sizes(userSize: 44)   // scale = 44/11 = 4
+        XCTAssertEqual(atFortyFour.body, 44)
+        XCTAssertEqual(atFortyFour.heading, 64)
+
+        XCTAssertEqual(atTwentyTwo.heading / atTwentyTwo.body, 16.0 / 11.0, accuracy: 0.001,
+                       "the authored 16pt-to-11pt ratio must survive scaling")
+        XCTAssertEqual(atFortyFour.heading / atFortyFour.body, 16.0 / 11.0, accuracy: 0.001)
+        XCTAssertNotEqual(atTwentyTwo.body, atFortyFour.body,
+                          "the user's reading size must still govern the overall scale")
+    }
+
+    /// A span with NO authored size is untouched by `documentDefaultFontSize` entirely — it keeps
+    /// whatever size the surrounding block's own theme font already is (already `theme.baseFontSize`
+    /// scaled, with no further multiplication).
+    func testSpanWithNoAuthoredFontSizeIgnoresTheDocumentDefaultScale() {
+        let out = OfficeTextBuilder.build([.paragraph(spans: [span("plain")])],
+                                          theme: RenderTheme.current(size: 30), documentDefaultFontSize: 11)
+        let font = out.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
+        XCTAssertEqual(font?.pointSize, RenderTheme.current(size: 30).bodyFont.pointSize)
+    }
+
+    // MARK: S13 — alignment
+
+    func testExplicitAlignmentWinsOverTheRTLDefaultEdge() {
+        let out = build([.paragraph(spans: [span("text")], rtl: true, alignment: .center)])
+        let style = out.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle
+        XCTAssertEqual(style?.alignment, .center)
+        XCTAssertEqual(style?.baseWritingDirection, .rightToLeft,
+                       "an explicit alignment must not suppress the base direction")
+    }
+
+    func testNilAlignmentLeavesNaturalAlignmentExactlyAsBefore() {
+        let out = build([.paragraph(spans: [span("text")])])
+        let style = out.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle
+        XCTAssertEqual(style?.alignment, .natural)
+    }
+
+    func testHeadingAndListItemAlsoRespectAnExplicitAlignment() {
+        let headingOut = build([.heading(level: 1, spans: [span("H")], alignment: .right)])
+        let headingStyle = headingOut.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle
+        XCTAssertEqual(headingStyle?.alignment, .right)
+
+        let listOut = build([.listItem(level: 0, ordered: false, spans: [span("I")], alignment: .center)])
+        let listStyle = listOut.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle
+        XCTAssertEqual(listStyle?.alignment, .center)
+    }
+
+    // MARK: S13 — tab stops
+
+    func testParagraphTabStopsAreAddedToTheParagraphStyle() {
+        let out = build([.paragraph(spans: [span("a\tb")], tabStops: [100, 200])])
+        let style = out.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle
+        let locations = style?.tabStops.map(\.location) ?? []
+        XCTAssertTrue(locations.contains(100))
+        XCTAssertTrue(locations.contains(200))
+    }
+
+    func testEmptyTabStopsLeaveTheParagraphStylesDefaultTabsUnchanged() {
+        let withNone = build([.paragraph(spans: [span("text")])])
+        let withEmpty = build([.paragraph(spans: [span("text")], tabStops: [])])
+        let styleA = withNone.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle
+        let styleB = withEmpty.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle
+        XCTAssertEqual(styleA?.tabStops.map(\.location), styleB?.tabStops.map(\.location))
+    }
+
+    /// THE BRIEF'S REQUIRED CASE: a custom tab stop must coexist with, not break, a list item's own
+    /// hanging-indent geometry — the marker's own tab stays FIRST and at its usual position, and the
+    /// item's indentation (`headIndent`/`firstLineHeadIndent`) is completely unaffected by an
+    /// authored tab stop being present.
+    func testListItemTabStopsCoexistWithTheMarkersOwnHangingIndentTab() {
+        let plain = build([.listItem(level: 1, ordered: true, spans: [span("Item")])])
+        let withTab = build([.listItem(level: 1, ordered: true, spans: [span("Item")], tabStops: [300])])
+        let plainStyle = plain.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle
+        let tabStyle = withTab.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle
+
+        XCTAssertEqual(tabStyle?.headIndent, plainStyle?.headIndent, "hanging indent must be unaffected")
+        XCTAssertEqual(tabStyle?.firstLineHeadIndent, plainStyle?.firstLineHeadIndent)
+        let plainLocations = plainStyle?.tabStops.map(\.location) ?? []
+        let tabLocations = tabStyle?.tabStops.map(\.location) ?? []
+        XCTAssertEqual(tabLocations.first, plainLocations.first, "the marker's own tab must still be first")
+        XCTAssertTrue(tabLocations.contains(300), "the authored tab stop must still be present alongside it")
+    }
+
+    // MARK: S13 — table cell shading / borders / width
+
+    func testCellBackgroundColorOverridesTheThemeDefaultShading() {
+        let out = build([.table(rows: [[Cell(blocks: [.paragraph(spans: [span("A")])], backgroundColor: .systemGreen)]],
+                                headerRows: 0)])
+        let block = tableBlocks(in: out).first
+        XCTAssertEqual(block?.backgroundColor, .systemGreen)
+    }
+
+    /// An explicit background on a HEADER cell overrides the theme's own header shading, not just
+    /// a body cell's blank default.
+    func testHeaderCellExplicitBackgroundColorOverridesThemeHeaderShading() {
+        let out = build([.table(rows: [[Cell(blocks: [.paragraph(spans: [span("H")])], backgroundColor: .systemTeal)]],
+                                headerRows: 1)])
+        let block = tableBlocks(in: out).first
+        XCTAssertEqual(block?.backgroundColor, .systemTeal)
+    }
+
+    func testCellBorderColorAndWidthOverrideTheThemeDefault() {
+        let out = build([.table(rows: [[Cell(blocks: [.paragraph(spans: [span("A")])],
+                                             borderColor: .systemPurple, borderWidth: 3)]], headerRows: 0)])
+        let block = try! XCTUnwrap(tableBlocks(in: out).first)
+        XCTAssertEqual(block.borderColor(for: .minX), .systemPurple)
+        XCTAssertEqual(block.width(for: .border, edge: .minX), 3)
+    }
+
+    func testCellWidthSetsTheTextTableBlocksAbsoluteContentWidth() {
+        let out = build([.table(rows: [[Cell(blocks: [.paragraph(spans: [span("A")])], width: 120)]], headerRows: 0)])
+        let block = try! XCTUnwrap(tableBlocks(in: out).first)
+        XCTAssertEqual(block.value(for: .width), 120)
+        XCTAssertEqual(block.valueType(for: .width), .absoluteValueType)
+    }
+
+    /// The pre-sprint construction path (`Cell(spans:)`) leaves all four fields `nil` — the theme's
+    /// existing defaults (no shading, `Palette.tableBorder` at 1pt, auto column layout) must be
+    /// exactly what a cell with no shading/border/width info renders as.
+    func testCellWithNoShadingBorderOrWidthKeepsExactlyTheThemeDefaults() {
+        let out = build([.table(rows: [[Cell(spans: [span("A")])]], headerRows: 0)])
+        let block = try! XCTUnwrap(tableBlocks(in: out).first)
+        XCTAssertNil(block.backgroundColor)
+        XCTAssertEqual(block.borderColor(for: .minX), Palette.tableBorder)
+        XCTAssertEqual(block.width(for: .border, edge: .minX), 1)
+    }
+
+    /// Merged cells (R1's `colSpan`) must still work once a cell can ALSO carry shading — the two
+    /// features must not interfere with each other.
+    func testMergedCellWithShadingStillAppliesBothItsSpanAndItsShading() {
+        let rows: [[Cell]] = [[Cell(blocks: [.paragraph(spans: [span("Wide")])], colSpan: 2, backgroundColor: .systemOrange)]]
+        let out = build([.table(rows: rows, headerRows: 0)])
+        let block = try! XCTUnwrap(tableBlocks(in: out).first)
+        XCTAssertEqual(block.columnSpan, 2)
+        XCTAssertEqual(block.backgroundColor, .systemOrange)
     }
 }

@@ -179,10 +179,13 @@ enum DocxReader {
     /// caller falls back to a standalone marker paragraph instead.
     private static func prependingMarker(_ marker: Span, to block: OfficeBlock) -> OfficeBlock? {
         switch block {
-        case .paragraph(let spans, let rtl): return .paragraph(spans: [marker] + spans, rtl: rtl)
-        case .heading(let level, let spans, let rtl): return .heading(level: level, spans: [marker] + spans, rtl: rtl)
-        case .listItem(let level, let ordered, let spans, let itemMarker, let rtl):
-            return .listItem(level: level, ordered: ordered, spans: [marker] + spans, marker: itemMarker, rtl: rtl)
+        case .paragraph(let spans, let rtl, let alignment, let tabStops):
+            return .paragraph(spans: [marker] + spans, rtl: rtl, alignment: alignment, tabStops: tabStops)
+        case .heading(let level, let spans, let rtl, let alignment, let tabStops):
+            return .heading(level: level, spans: [marker] + spans, rtl: rtl, alignment: alignment, tabStops: tabStops)
+        case .listItem(let level, let ordered, let spans, let itemMarker, let rtl, let alignment, let tabStops):
+            return .listItem(level: level, ordered: ordered, spans: [marker] + spans, marker: itemMarker, rtl: rtl,
+                              alignment: alignment, tabStops: tabStops)
         case .table, .image, .unsupportedGraphic, .formula: return nil
         }
     }
@@ -718,7 +721,7 @@ enum DocxReader {
     /// table block is never "empty" in this sense and always passes through.
     private static func isEmptyTextBlock(_ block: OfficeBlock) -> Bool {
         switch block {
-        case .paragraph(let spans, _), .heading(_, let spans, _), .listItem(_, _, let spans, _, _):
+        case .paragraph(let spans, _, _, _), .heading(_, let spans, _, _, _), .listItem(_, _, let spans, _, _, _, _):
             return spans.isEmpty
         case .table, .image, .unsupportedGraphic, .formula:
             return false

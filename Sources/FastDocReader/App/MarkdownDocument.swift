@@ -10,6 +10,13 @@ final class MarkdownDocument: NSDocument {
     /// Empty for every other kind.
     private(set) var officeBlocks: [OfficeBlock] = []
 
+    /// The SOURCE document's own default body run size, in points — see
+    /// `OfficeTextBuilder.build`'s `documentDefaultFontSize` doc for the font-size model this
+    /// feeds. `11` (the OOXML default when a document states none) until a reader actually
+    /// resolves `w:docDefaults`/ODT's default paragraph style and passes a real value into
+    /// `setOfficeContent` — this sprint only wires the parameter through; no reader sets it yet.
+    private(set) var officeDefaultBodyFontSize: CGFloat = 11
+
     /// The archive `officeBlocks` was parsed from, kept so an `.image` block's id (an archive entry
     /// path, e.g. `"word/media/image1.png"`) can be pulled on demand when it scrolls into view — the
     /// same lazy-pixels discipline `reconcileMedia` already gives markdown images, not a second
@@ -93,9 +100,10 @@ final class MarkdownDocument: NSDocument {
     /// block's id to bytes. Not `private` — `OfficeDocumentTests` drives image loading against
     /// synthetic blocks/archives it builds itself, independent of whatever `DocxReader` parses (that
     /// parser's own correctness is `DocxReaderTests`' job, not this file's).
-    func setOfficeContent(blocks: [OfficeBlock], archive: ZipArchive) {
+    func setOfficeContent(blocks: [OfficeBlock], archive: ZipArchive, defaultBodyFontSize: CGFloat = 11) {
         self.officeBlocks = blocks
         self.officeArchive = archive
+        self.officeDefaultBodyFontSize = defaultBodyFontSize
         self.text = ""
         self.file = TextFile(text: "", encoding: .utf8, hasBOM: false)
     }
@@ -476,7 +484,8 @@ final class MarkdownDocument: NSDocument {
         // `OfficeTextBuilder.appendImage`) — the same width `presizeKnownMedia` reads for markdown,
         // already real by this point (set in `DocumentWindowController.init`/`display`).
         case .office: attr = OfficeTextBuilder.build(officeBlocks, theme: theme,
-                                                      columnWidth: wc.textView.textContainer?.size.width ?? 800)
+                                                      columnWidth: wc.textView.textContainer?.size.width ?? 800,
+                                                      documentDefaultFontSize: officeDefaultBodyFontSize)
         }
         wc.display(attr)
         wc.window?.title = displayName ?? "fast-md-reader"

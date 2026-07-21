@@ -37,6 +37,37 @@ struct Span: Equatable {
     /// its neighbour (see both readers' `appendMerging`) — merging would smear the marker's exact
     /// position across text that predates the bookmark.
     var bookmarks: [String] = []
+    /// The run's authored text colour, already resolved to a literal RGB — `nil` means the source
+    /// didn't specify one (or, for a THEME colour reference such as docx `w:color/@themeColor`,
+    /// that a reader hasn't resolved it to a literal value yet; resolving those references against
+    /// the document's theme part is later work, but this field is exactly where that resolved
+    /// colour goes once it exists — nothing about this vocabulary or `OfficeTextBuilder` needs to
+    /// change to receive it). `nil` is NOT "black" — `OfficeTextBuilder` decides what an unset (or,
+    /// per its own judgement call, a near-neutral authored) colour renders as; see its
+    /// `resolvedTextColor`.
+    var textColor: NSColor? = nil
+    /// The run's highlighter/background colour (docx `w:highlight`/`w:shd`, odt
+    /// `style:text-background-color`) — `nil` for no highlight. Unlike `textColor`, a highlight is
+    /// never reinterpreted against the reading theme: painting a background behind text is already
+    /// an unambiguous, deliberate mark (there's no "ordinary black highlight" the way there's
+    /// "ordinary black body text"), so it is always drawn exactly as authored.
+    var highlightColor: NSColor? = nil
+    /// The run's authored font size, in POINTS — a reader converts from its own source unit before
+    /// constructing this (docx `w:sz`/`w:szCs` are HALF-points; ODT `fo:font-size` is already
+    /// points). `nil` means the source didn't specify a size for this run — see
+    /// `OfficeTextBuilder.build`'s `documentDefaultFontSize` parameter for exactly how a non-nil
+    /// value becomes a rendered size (the model is Word's own: authored size scaled by the ratio
+    /// between the user's chosen reading size and the document's own default body size, so a
+    /// heading stays proportionally larger than body text at ANY reading size, and the reading-size
+    /// setting still governs how big the whole document looks).
+    var fontSize: CGFloat? = nil
+    /// The run's authored font FAMILY name (docx `w:rFonts/@w:ascii`, odt `style:font-name`) —
+    /// `nil` means "the theme's own body/heading/code font", exactly as before this field existed.
+    /// Never applied to a `code` span: `OfficeTextBuilder`'s inline-code styling is a single,
+    /// consistent monospaced look across the whole app (see `Palette`'s "one deliberate spot of
+    /// color" reasoning) — letting an authored family override it would make some code spans
+    /// inconsistent with others for no reason a reader would understand.
+    var fontName: String? = nil
 }
 
 /// One cell of a table row. Only ANCHOR cells — the top-left corner of a merge — appear in
@@ -57,6 +88,28 @@ struct Cell: Equatable {
     var blocks: [OfficeBlock]
     var rowSpan: Int = 1
     var colSpan: Int = 1
+    /// The cell's own shading (docx `w:tcPr/w:shd/@w:fill`, odt `style:background-color` on the
+    /// cell's style) — `nil` means unshaded, which `TableBlockBuilder` still shades with
+    /// `Palette.tableHeaderBg` for a header row exactly as it did before this field existed (an
+    /// explicit `backgroundColor` on a HEADER cell overrides that theme shading; on a body cell it
+    /// is the only shading there is).
+    var backgroundColor: NSColor? = nil
+    /// The cell's own border colour/width (docx `w:tcPr/w:tcBorders`, odt cell-style borders) —
+    /// either or both may be `nil`, in which case `TableBlockBuilder`'s existing theme default
+    /// (`Palette.tableBorder` at 1pt) is used for that one, exactly as before this field existed.
+    /// A real per-edge border model (top/bottom/left/right independently) is out of this sprint's
+    /// scope — both readers' input formats can express far more than this vocabulary carries yet,
+    /// and one uniform colour/width already covers the measured "borders" need without inventing
+    /// four fields no parser fills in this sprint.
+    var borderColor: NSColor? = nil
+    var borderWidth: CGFloat? = nil
+    /// The cell's own declared column width in POINTS (docx `w:tcPr/w:tcW`, converted from twips;
+    /// odt column widths) — `nil` leaves `TableBlockBuilder`'s existing auto layout (equal-ish,
+    /// content-driven column sizing via the table's own `percentageValueType`) untouched, exactly
+    /// as before this field existed. Set on the grid's anchor cells; a merged cell's covered
+    /// positions have no `Cell` of their own to carry a width at all (see `OfficeBlock.table`'s doc
+    /// comment on anchor-only rows).
+    var width: CGFloat? = nil
 
     /// Back-compat convenience for the many construction sites (both readers' plain-text cells,
     /// most existing tests) that only ever need a cell of formatted text — wraps the spans in a
@@ -69,10 +122,16 @@ struct Cell: Equatable {
         self.colSpan = colSpan
     }
 
-    init(blocks: [OfficeBlock], rowSpan: Int = 1, colSpan: Int = 1) {
+    init(blocks: [OfficeBlock], rowSpan: Int = 1, colSpan: Int = 1,
+         backgroundColor: NSColor? = nil, borderColor: NSColor? = nil, borderWidth: CGFloat? = nil,
+         width: CGFloat? = nil) {
         self.blocks = blocks
         self.rowSpan = rowSpan
         self.colSpan = colSpan
+        self.backgroundColor = backgroundColor
+        self.borderColor = borderColor
+        self.borderWidth = borderWidth
+        self.width = width
     }
 }
 
@@ -87,19 +146,24 @@ enum OfficeBlock: Equatable {
     ///
     /// This is a PARAGRAPH property, not a font one: docx's `w:pPr/w:bidi` and ODT's paragraph-style
     /// `style:writing-mode="rl-tb"` both mark the whole block, deciding where it BEGINS, which side
-    /// neutral characters (digits, punctuation, brackets) resolve toward at its edges, and — until a
-    /// later sprint reads `w:jc`/`fo:text-align` and an explicit alignment must win over this default
-    /// — which edge the block starts flush against. TextKit's own bidirectional algorithm already
-    /// reorders mixed-direction RUNS correctly within a line once it knows the paragraph's base
-    /// direction; what it cannot recover on its own is THAT base direction when the source doesn't
-    /// say, which is exactly what carrying this bit through from the reader restores (see
-    /// `OfficeTextBuilder`, which turns it into `NSParagraphStyle.baseWritingDirection`, never a
-    /// guessed `NSTextAlignment` — `.natural` alignment already resolves to the right edge once the
-    /// base direction is `.rightToLeft`, so setting alignment explicitly here would just be a second,
-    /// redundant way of saying the same thing and a second place S13/S14 would have to remember to
-    /// override).
-    case heading(level: Int, spans: [Span], rtl: Bool = false)
-    case paragraph(spans: [Span], rtl: Bool = false)
+    /// neutral characters (digits, punctuation, brackets) resolve toward at its edges, and — when
+    /// `alignment` below is `nil` — which edge the block starts flush against. TextKit's own
+    /// bidirectional algorithm already reorders mixed-direction RUNS correctly within a line once
+    /// it knows the paragraph's base direction; what it cannot recover on its own is THAT base
+    /// direction when the source doesn't say, which is exactly what carrying this bit through from
+    /// the reader restores (see `OfficeTextBuilder`, which turns it into
+    /// `NSParagraphStyle.baseWritingDirection`). An EXPLICIT `alignment` always wins over this
+    /// default — `.natural` alignment already resolves to the right edge once the base direction is
+    /// `.rightToLeft`, so `rtl` alone is only ever a fallback for when the source has no explicit
+    /// alignment of its own to say instead.
+    ///
+    /// `alignment` (docx `w:pPr/w:jc`, odt `fo:text-align`) is `nil` when the source didn't say —
+    /// meaning "let `rtl`/the theme's own default decide", never a hardcoded `.left`. `tabStops`
+    /// (docx `w:pPr/w:tabs`, odt `style:tab-stop`) are the paragraph's OWN authored stops, in
+    /// POINTS, in addition to whatever tab machinery the block already has for other reasons — a
+    /// `listItem`'s marker tab (see below) is never replaced by these, only added to.
+    case heading(level: Int, spans: [Span], rtl: Bool = false, alignment: NSTextAlignment? = nil, tabStops: [CGFloat] = [])
+    case paragraph(spans: [Span], rtl: Bool = false, alignment: NSTextAlignment? = nil, tabStops: [CGFloat] = [])
     /// `level` is a 0-based nesting depth. `ordered` selects "1. 2. 3." numbering — per level,
     /// restarting when a SHALLOWER level intervenes but continuing across a deeper nested run —
     /// vs a bullet. See `OfficeTextBuilder` for the exact restart rule.
@@ -119,7 +183,13 @@ enum OfficeBlock: Equatable {
     /// compute — same principle as `image`'s reserved-but-unloaded size, applied to text instead
     /// of pixels). `ordered`/`level` still drive indentation and the bullet glyph even when
     /// `marker` is supplied — only the marker TEXT bypasses the builder's own counters.
-    case listItem(level: Int, ordered: Bool, spans: [Span], marker: String? = nil, rtl: Bool = false)
+    ///
+    /// `alignment`/`tabStops` mean exactly what they mean on `.paragraph`/`.heading` above. A
+    /// custom tab stop never displaces the marker's own hanging-indent tab — `OfficeTextBuilder`
+    /// APPENDS these after it, so `1.\t<text>` still lands the text at the item's hanging indent
+    /// first and any authored stops beyond that still work inside the item's own text.
+    case listItem(level: Int, ordered: Bool, spans: [Span], marker: String? = nil, rtl: Bool = false,
+                  alignment: NSTextAlignment? = nil, tabStops: [CGFloat] = [])
     /// Rows of ANCHOR cells only (`rows[row]` lists the cells that START in that row, left to
     /// right — a row's `count` is therefore the number of anchors in it, NOT the column count once
     /// any span is wider than 1; a parser reading `w:gridSpan`/`table:number-columns-spanned` must

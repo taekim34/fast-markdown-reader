@@ -12,13 +12,33 @@ enum OfficeTextBuilder {
     /// (every test but the scaling one) get the declared size back untouched. A real caller
     /// (`MarkdownDocument.render(into:)`) always passes the reader's actual column width: office
     /// image sizing is decided HERE, once, at build time — never at load time (see `appendImage`).
+    ///
+    /// `documentDefaultFontSize` is the SOURCE document's own default body run size, in points
+    /// (docx `w:docDefaults/w:rPrDefault/w:rPr/w:sz`, HALF-points, converted by the reader; the
+    /// OOXML default when a document states none at all is 11pt — the same default this parameter
+    /// itself defaults to, so a caller that hasn't wired a reader-supplied value through yet still
+    /// gets the standard behaviour). This is the OTHER half of the font-size model, alongside
+    /// `Span.fontSize`: the document, as authored, is 100% — `theme.baseFontSize` (the user's
+    /// reading-size preference, `FontSizeStore.size`) is multiplied on top of it, as the RATIO
+    /// `theme.baseFontSize / documentDefaultFontSize`. A run that names an explicit size (a 22
+    /// half-point body run, a 32 half-point heading — `Span.fontSize` 11pt/16pt) is scaled by that
+    /// ratio; a run that names none keeps whatever the surrounding block's OWN base font already is
+    /// (`theme.headingFont(level:)`/`theme.bodyFont`), which is already sized off `theme.baseFontSize`
+    /// with no further scaling. Two things this preserves, deliberately, the way Word itself does:
+    /// a document's own internal relationships survive the user's reading-size setting (a heading
+    /// stays proportionally larger than body text, an emphasised 14pt line stays larger than an
+    /// 11pt paragraph, AT ANY reading size) — and the reading-size setting still governs how big
+    /// the document looks overall, which is the entire point of that setting and must never be
+    /// silently overridden by what the document happened to be authored at.
     static func build(_ blocks: [OfficeBlock], theme: RenderTheme,
-                      columnWidth: CGFloat = .greatestFiniteMagnitude) -> NSAttributedString {
+                      columnWidth: CGFloat = .greatestFiniteMagnitude,
+                      documentDefaultFontSize: CGFloat = 11) -> NSAttributedString {
         let result = NSMutableAttributedString()
         var blockSeq = 0
         // Ordered-list numbering state, keyed by nesting level. Lives for the whole build() call
         // (not per-block) because the restart rule below needs to see across blocks.
         var orderedCounters: [Int: Int] = [:]
+        let fontSizeScale = documentDefaultFontSize > 0 ? theme.baseFontSize / documentDefaultFontSize : 1
 
         func tagBlock(from start: Int) {
             let r = NSRange(location: start, length: result.length - start)
@@ -30,31 +50,38 @@ enum OfficeTextBuilder {
         for block in blocks {
             let start = result.length
             switch block {
-            case let .heading(level, spans, rtl):
+            case let .heading(level, spans, rtl, alignment, tabStops):
                 result.append(spansAttributedString(spans, baseFont: theme.headingFont(level: level),
-                                                     baseColor: theme.textColor, theme: theme))
+                                                     baseColor: theme.textColor, theme: theme,
+                                                     fontSizeScale: fontSizeScale))
                 // Tagged BEFORE the trailing newline is appended, so a substring of this range is
                 // exactly the heading's text — precisely what the outline sidebar reads
                 // (`OutlinePanel.reload` trims and shows it verbatim).
                 result.addAttribute(MDAttr.heading, value: level,
                                      range: NSRange(location: start, length: result.length - start))
                 result.append(NSAttributedString(string: "\n"))
-                result.addAttribute(.paragraphStyle, value: headingParagraphStyle(level: level, theme: theme, rtl: rtl),
-                                     range: NSRange(location: start, length: result.length - start))
+                result.addAttribute(.paragraphStyle,
+                                    value: headingParagraphStyle(level: level, theme: theme, rtl: rtl,
+                                                                  alignment: alignment, tabStops: tabStops),
+                                    range: NSRange(location: start, length: result.length - start))
 
-            case let .paragraph(spans, rtl):
+            case let .paragraph(spans, rtl, alignment, tabStops):
                 result.append(spansAttributedString(spans, baseFont: theme.bodyFont,
-                                                     baseColor: theme.textColor, theme: theme))
+                                                     baseColor: theme.textColor, theme: theme,
+                                                     fontSizeScale: fontSizeScale))
                 result.append(NSAttributedString(string: "\n"))
-                result.addAttribute(.paragraphStyle, value: bodyParagraphStyle(theme: theme, rtl: rtl),
-                                     range: NSRange(location: start, length: result.length - start))
+                result.addAttribute(.paragraphStyle,
+                                    value: bodyParagraphStyle(theme: theme, rtl: rtl, alignment: alignment,
+                                                               tabStops: tabStops),
+                                    range: NSRange(location: start, length: result.length - start))
 
-            case let .listItem(level, ordered, spans, marker, rtl):
-                appendListItem(level: level, ordered: ordered, spans: spans, marker: marker, rtl: rtl, into: result,
-                                theme: theme, orderedCounters: &orderedCounters)
+            case let .listItem(level, ordered, spans, marker, rtl, alignment, tabStops):
+                appendListItem(level: level, ordered: ordered, spans: spans, marker: marker, rtl: rtl,
+                               alignment: alignment, tabStops: tabStops, into: result,
+                               theme: theme, orderedCounters: &orderedCounters, fontSizeScale: fontSizeScale)
 
             case let .table(rows, headerRows):
-                appendTable(rows, headerRows: headerRows, into: result, theme: theme)
+                appendTable(rows, headerRows: headerRows, into: result, theme: theme, fontSizeScale: fontSizeScale)
 
             case let .image(id, size):
                 appendImage(id: id, size: size, columnWidth: columnWidth, into: result)
@@ -79,8 +106,13 @@ enum OfficeTextBuilder {
     ///
     /// NOT private: a later sprint's RTF reader re-themes spans it parsed itself rather than
     /// receiving as `OfficeBlock`, and needs this exact styling logic rather than a duplicate.
+    ///
+    /// `fontSizeScale` is `theme.baseFontSize / documentDefaultFontSize` (see `build`'s doc comment
+    /// for the model) — defaulted to `1` so every pre-sprint call site (this file's own cell/list
+    /// helpers used to, and `OfficeTextBuilderTests`' direct calls still do, pass none) keeps
+    /// meaning "don't rescale", i.e. `Span.fontSize` is already in the units the caller wants.
     static func spansAttributedString(_ spans: [Span], baseFont: NSFont, baseColor: NSColor,
-                                      theme: RenderTheme) -> NSAttributedString {
+                                      theme: RenderTheme, fontSizeScale: CGFloat = 1) -> NSAttributedString {
         let out = NSMutableAttributedString()
         for span in spans {
             var font = baseFont
@@ -90,6 +122,17 @@ enum OfficeTextBuilder {
                 font = theme.codeFont
                 color = theme.inlineCodeColor
                 attrs[MDAttr.inlineCode] = true
+            } else if let name = span.fontName, let named = NSFont(name: name, size: font.pointSize) {
+                // Family override — never applied to a `code` span (see `Span.fontName`'s doc).
+                font = named
+            }
+            // An authored size REPLACES the block's base size before bold/italic/super-sub touch
+            // it, so those still layer on top of the right starting point (traits preserve family,
+            // not size; scaling preserves family, not traits — order doesn't matter between the
+            // two, but both must happen before either reads `font.pointSize` for anything else).
+            if let authoredSize = span.fontSize {
+                let scaled = max(1, (authoredSize * fontSizeScale).rounded())
+                font = NSFont(descriptor: font.fontDescriptor, size: scaled) ?? font
             }
             var traits: NSFontDescriptor.SymbolicTraits = []
             if span.bold { traits.insert(.bold) }
@@ -110,8 +153,18 @@ enum OfficeTextBuilder {
                 font = fontScaled(font, by: 0.7)
                 attrs[.baselineOffset] = lowered
             }
+            // Authored colour is resolved against the theme, never applied raw — see
+            // `resolvedTextColor`'s doc for the ordinary-ink-vs-marked-colour decision. Skipped for
+            // a `code` span for the same reason `fontName` is: the inline-code look is one
+            // consistent accent across the whole app, not something an individual run overrides.
+            if let authoredColor = span.textColor, !span.code {
+                color = resolvedTextColor(authoredColor, theme: theme)
+            }
             attrs[.font] = font
             attrs[.foregroundColor] = color
+            // Always drawn exactly as authored — see `Span.highlightColor`'s doc for why a
+            // highlight, unlike text colour, is never reinterpreted against the theme.
+            if let highlight = span.highlightColor { attrs[.backgroundColor] = highlight }
             if span.underline { attrs[.underlineStyle] = NSUnderlineStyle.single.rawValue }
             if span.strikethrough { attrs[.strikethroughStyle] = NSUnderlineStyle.single.rawValue }
             // Same colour/underline treatment `MarkdownRenderer.inlineFragment`'s `Markdown.Link`
@@ -156,6 +209,28 @@ enum OfficeTextBuilder {
         return out
     }
 
+    /// Decides whether an authored run colour survives into the current reading theme, or steps
+    /// aside for the theme's own text colour. The judgement call the app makes: a NEAR-NEUTRAL
+    /// authored colour (low saturation — almost always literal black, occasionally literal white)
+    /// reads as "ORDINARY" — the author never meant to mark this text, they typed body copy under
+    /// whatever their template's default run colour happened to be. Honouring that literally under
+    /// the dark theme is exactly how ordinary text goes invisible (black-on-near-black); stepping
+    /// aside for `theme.textColor` makes an authored-black run behave IDENTICALLY to a run that
+    /// authored no colour at all, which is the only self-consistent reading of "ordinary" text.
+    /// A genuinely COLOURFUL authored run (a red warning, a brand blue) has enough saturation to
+    /// read as a DELIBERATE mark, and is drawn exactly as authored in both themes — losing that
+    /// distinction would lose the meaning the colour exists to carry (a warning that silently
+    /// becomes normal-coloured text is a warning nobody can see).
+    ///
+    /// `0.12` is a low bar deliberately: it only has to separate "grey/black/white" from "has a
+    /// hue at all", not fine-tune how vivid a colour must be to count as a mark.
+    static func resolvedTextColor(_ authored: NSColor, theme: RenderTheme) -> NSColor {
+        guard let rgb = authored.usingColorSpace(.deviceRGB) else { return theme.textColor }
+        var hue: CGFloat = 0, saturation: CGFloat = 0, brightness: CGFloat = 0, alpha: CGFloat = 0
+        rgb.getHue(&hue, saturation: &saturation, brightness: &brightness, alpha: &alpha)
+        return saturation < 0.12 ? theme.textColor : authored
+    }
+
     /// Adds symbolic traits while keeping the SAME family, so vertical metrics (ascent/descent)
     /// don't shift — an unrelated bold face would jitter the baseline under a fixed line height
     /// (same reasoning as `MarkdownRenderer.fontAdding`, duplicated here: that one is private to
@@ -175,21 +250,29 @@ enum OfficeTextBuilder {
 
     /// `rtl` sets `baseWritingDirection` ONLY when true — an LTR block (`rtl == false`, every
     /// existing call site before this sprint) leaves it at `NSMutableParagraphStyle()`'s own default
-    /// (`.natural`), so a pre-sprint document's paragraph style is byte-identical to before. `.natural`
-    /// ALIGNMENT is left untouched either way: once the base direction is explicitly `.rightToLeft`,
-    /// `.natural` alignment already resolves to the right edge on its own — see `OfficeBlock`'s doc
-    /// for why that means alignment doesn't need setting here too.
-    private static func bodyParagraphStyle(theme: RenderTheme, rtl: Bool = false) -> NSParagraphStyle {
+    /// (`.natural`), so a pre-sprint document's paragraph style is byte-identical to before.
+    /// `alignment`, when supplied, ALWAYS wins over `rtl`'s implicit edge (see `OfficeBlock`'s doc
+    /// on the two) — `nil` (every pre-sprint call site) leaves `.natural` exactly as `rtl` alone
+    /// left it before this parameter existed. `tabStops` (points) are appended to whatever default
+    /// tab stops `NSMutableParagraphStyle()` already carries; empty (every pre-sprint call site)
+    /// changes nothing.
+    private static func bodyParagraphStyle(theme: RenderTheme, rtl: Bool = false,
+                                            alignment: NSTextAlignment? = nil,
+                                            tabStops: [CGFloat] = []) -> NSParagraphStyle {
         let p = NSMutableParagraphStyle()
         let lh = (theme.baseFontSize * 1.45).rounded()
         p.minimumLineHeight = lh
         p.maximumLineHeight = lh
         p.paragraphSpacing = theme.baseFontSize * 0.9
         if rtl { p.baseWritingDirection = .rightToLeft }
+        if let alignment { p.alignment = alignment }
+        if !tabStops.isEmpty { p.tabStops = tabStops.map { NSTextTab(textAlignment: .left, location: $0) } }
         return p.copy() as! NSParagraphStyle
     }
 
-    private static func headingParagraphStyle(level: Int, theme: RenderTheme, rtl: Bool = false) -> NSParagraphStyle {
+    private static func headingParagraphStyle(level: Int, theme: RenderTheme, rtl: Bool = false,
+                                               alignment: NSTextAlignment? = nil,
+                                               tabStops: [CGFloat] = []) -> NSParagraphStyle {
         let b = theme.baseFontSize
         let p = NSMutableParagraphStyle()
         let lh = (theme.headingSize(level: level) * 1.25).rounded()
@@ -198,6 +281,8 @@ enum OfficeTextBuilder {
         p.paragraphSpacing = b * 0.4
         p.paragraphSpacingBefore = b * (level <= 2 ? 1.9 : 1.4)
         if rtl { p.baseWritingDirection = .rightToLeft }
+        if let alignment { p.alignment = alignment }
+        if !tabStops.isEmpty { p.tabStops = tabStops.map { NSTextTab(textAlignment: .left, location: $0) } }
         return p.copy() as! NSParagraphStyle
     }
 
@@ -215,8 +300,13 @@ enum OfficeTextBuilder {
 
     /// Hanging-indent paragraph style: marker at `markerX`, a tab pushes text to `textX`, and
     /// wrapped lines align at `textX` — so the item's first line and every wrap share one edge.
+    /// `extraTabStops` (points, from `OfficeBlock.listItem.tabStops`) are AUTHORED stops beyond the
+    /// marker's own — appended after the marker tab, never in place of it, so `1.\t<text>` still
+    /// reaches the item's hanging indent first (this is the sprint brief's own required case: a
+    /// custom tab stop must coexist with, not break, list indentation).
     private static func listParagraphStyle(markerX: CGFloat, textX: CGFloat, theme: RenderTheme,
-                                            rtl: Bool = false) -> NSParagraphStyle {
+                                            rtl: Bool = false, alignment: NSTextAlignment? = nil,
+                                            extraTabStops: [CGFloat] = []) -> NSParagraphStyle {
         let p = NSMutableParagraphStyle()
         let lh = (theme.baseFontSize * 1.45).rounded()
         p.minimumLineHeight = lh
@@ -225,12 +315,14 @@ enum OfficeTextBuilder {
         p.firstLineHeadIndent = markerX
         p.headIndent = textX
         p.tabStops = [NSTextTab(textAlignment: .left, location: textX)]
+            + extraTabStops.map { NSTextTab(textAlignment: .left, location: $0) }
         p.defaultTabInterval = textX
         // The marker/hang-indent geometry (`markerX`/`textX`) is left exactly as it is for an LTR
         // item — mirroring it for RTL (marker on the right, indent growing leftward) is real work
         // this sprint's brief scoped out (base direction only); `baseWritingDirection` alone is
         // enough for TextKit to draw the text right-to-left, just still left-indented.
         if rtl { p.baseWritingDirection = .rightToLeft }
+        if let alignment { p.alignment = alignment }
         return p.copy() as! NSParagraphStyle
     }
 
@@ -250,8 +342,10 @@ enum OfficeTextBuilder {
     /// builder's own counters are a fallback for when the source couldn't supply that text, not a
     /// second, competing numbering scheme — the two never mix for a single item.
     private static func appendListItem(level: Int, ordered: Bool, spans: [Span], marker suppliedMarker: String?,
-                                       rtl: Bool = false, into result: NSMutableAttributedString, theme: RenderTheme,
-                                       orderedCounters: inout [Int: Int]) {
+                                       rtl: Bool = false, alignment: NSTextAlignment? = nil,
+                                       tabStops: [CGFloat] = [], into result: NSMutableAttributedString,
+                                       theme: RenderTheme, orderedCounters: inout [Int: Int],
+                                       fontSizeScale: CGFloat = 1) {
         let marker: String
         if let suppliedMarker {
             marker = suppliedMarker + "\t"
@@ -277,10 +371,12 @@ enum OfficeTextBuilder {
         let start = result.length
         result.append(NSAttributedString(string: marker,
             attributes: [.font: theme.bodyFont, .foregroundColor: theme.textColor]))
-        result.append(spansAttributedString(spans, baseFont: theme.bodyFont, baseColor: theme.textColor, theme: theme))
+        result.append(spansAttributedString(spans, baseFont: theme.bodyFont, baseColor: theme.textColor,
+                                            theme: theme, fontSizeScale: fontSizeScale))
         result.append(NSAttributedString(string: "\n"))
         result.addAttribute(.paragraphStyle,
-                            value: listParagraphStyle(markerX: markerX, textX: textX, theme: theme, rtl: rtl),
+                            value: listParagraphStyle(markerX: markerX, textX: textX, theme: theme, rtl: rtl,
+                                                       alignment: alignment, extraTabStops: tabStops),
                             range: NSRange(location: start, length: result.length - start))
     }
 
@@ -293,7 +389,7 @@ enum OfficeTextBuilder {
     /// headerless table). A cell shorter than the widest row leaves its trailing columns empty
     /// rather than collapsing the row.
     private static func appendTable(_ rows: [[Cell]], headerRows: Int, into result: NSMutableAttributedString,
-                                    theme: RenderTheme) {
+                                    theme: RenderTheme, fontSizeScale: CGFloat = 1) {
         guard rows.contains(where: { !$0.isEmpty }) else {
             result.append(NSAttributedString(string: "\n"))
             return
@@ -302,8 +398,12 @@ enum OfficeTextBuilder {
         let cellRows: [[TableBlockBuilder.CellContent]] = rows.enumerated().map { r, anchors in
             let isHeader = r < headerRows
             return anchors.map { cell in
-                let content = cellContent(cell.blocks, baseFont: isHeader ? headerFont : theme.bodyFont, theme: theme)
-                return TableBlockBuilder.CellContent(content: content, rowSpan: cell.rowSpan, columnSpan: cell.colSpan)
+                let content = cellContent(cell.blocks, baseFont: isHeader ? headerFont : theme.bodyFont,
+                                          theme: theme, fontSizeScale: fontSizeScale)
+                return TableBlockBuilder.CellContent(content: content, rowSpan: cell.rowSpan, columnSpan: cell.colSpan,
+                                                      backgroundColor: cell.backgroundColor,
+                                                      borderColor: cell.borderColor, borderWidth: cell.borderWidth,
+                                                      width: cell.width)
             }
         }
         result.append(TableBlockBuilder.build(rows: cellRows, headerRows: headerRows, theme: theme))
@@ -326,27 +426,31 @@ enum OfficeTextBuilder {
     /// project's standing "nested tables flatten to text" decision, applied identically by both
     /// readers at parse time; this is the renderer's own backstop in case a `.table` block ever
     /// reaches a cell some other way).
-    private static func cellContent(_ blocks: [OfficeBlock], baseFont: NSFont, theme: RenderTheme) -> NSAttributedString {
+    private static func cellContent(_ blocks: [OfficeBlock], baseFont: NSFont, theme: RenderTheme,
+                                    fontSizeScale: CGFloat = 1) -> NSAttributedString {
         let result = NSMutableAttributedString()
         for (index, block) in blocks.enumerated() {
             switch block {
-            // `rtl` is dropped here (`_`), not lost: a cell's own paragraph style comes from
-            // `TableBlockBuilder`'s shared `cellLH` treatment, not from `bodyParagraphStyle`/
-            // `headingParagraphStyle`/`listParagraphStyle` above, so there is nowhere in a cell to
-            // apply a per-block base writing direction without reaching into that shared builder
-            // (out of this sprint's file scope). A cell's RUN-level direction (`Span.rtl`) still
-            // applies, unaffected — it's carried entirely inside `spansAttributedString`.
-            case let .heading(level, spans, _):
+            // `rtl`/`alignment`/`tabStops` are dropped here (`_`), not lost: a cell's own paragraph
+            // style comes from `TableBlockBuilder`'s shared `cellLH` treatment, not from
+            // `bodyParagraphStyle`/`headingParagraphStyle`/`listParagraphStyle` above, so there is
+            // nowhere in a cell to apply a per-block paragraph override without reaching into that
+            // shared builder (out of this sprint's file scope). A cell's RUN-level styling
+            // (`Span.rtl`, `Span.textColor`, …) still applies, unaffected — it's carried entirely
+            // inside `spansAttributedString`.
+            case let .heading(level, spans, _, _, _):
                 result.append(spansAttributedString(spans, baseFont: theme.headingFont(level: level),
-                                                     baseColor: theme.textColor, theme: theme))
-            case let .paragraph(spans, _):
-                result.append(spansAttributedString(spans, baseFont: baseFont, baseColor: theme.textColor, theme: theme))
-            case let .listItem(level, ordered, spans, marker, _):
+                                                     baseColor: theme.textColor, theme: theme,
+                                                     fontSizeScale: fontSizeScale))
+            case let .paragraph(spans, _, _, _):
+                result.append(spansAttributedString(spans, baseFont: baseFont, baseColor: theme.textColor,
+                                                     theme: theme, fontSizeScale: fontSizeScale))
+            case let .listItem(level, ordered, spans, marker, _, _, _):
                 // Cell-local numbering state — a list embedded in one cell doesn't continue a
                 // count begun in a sibling cell or at top level.
                 var counters: [Int: Int] = [:]
                 appendListItem(level: level, ordered: ordered, spans: spans, marker: marker, into: result,
-                                theme: theme, orderedCounters: &counters)
+                                theme: theme, orderedCounters: &counters, fontSizeScale: fontSizeScale)
                 if result.length > 0, result.string.hasSuffix("\n") {
                     result.deleteCharacters(in: NSRange(location: result.length - 1, length: 1))
                 }

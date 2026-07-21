@@ -19,6 +19,15 @@ enum TableBlockBuilder {
         var content: NSAttributedString
         var rowSpan: Int = 1
         var columnSpan: Int = 1
+        /// The cell's OWN shading/border/width, `nil`/`nil`/`nil`/`nil` meaning "use `build`'s
+        /// existing theme defaults" (header shading, `Palette.tableBorder` at 1pt, auto column
+        /// layout) exactly as before these fields existed — see `Cell`'s own doc comment in
+        /// `OfficeBlock.swift` for the source-format reasoning; this struct only carries the
+        /// already-decided values through to `NSTextTableBlock`.
+        var backgroundColor: NSColor? = nil
+        var borderColor: NSColor? = nil
+        var borderWidth: CGFloat? = nil
+        var width: CGFloat? = nil
     }
 
     /// - Parameters:
@@ -95,10 +104,20 @@ enum TableBlockBuilder {
             let header = placement.row < headerRows
             let block = NSTextTableBlock(table: textTable, startingRow: placement.row, rowSpan: placement.rowSpan,
                                          startingColumn: placement.col, columnSpan: placement.colSpan)
-            block.setBorderColor(Palette.tableBorder)
-            block.setWidth(1, type: .absoluteValueType, for: .border)
+            // An authored border/width/background on the ANCHOR cell wins over the theme default —
+            // a covered position (`placement.cell == nil`, padding the grid) never has one to win
+            // with, so it always gets the plain theme look.
+            block.setBorderColor(placement.cell?.borderColor ?? Palette.tableBorder)
+            block.setWidth(placement.cell?.borderWidth ?? 1, type: .absoluteValueType, for: .border)
             block.setWidth(7, type: .absoluteValueType, for: .padding)
-            if header { block.backgroundColor = Palette.tableHeaderBg }
+            if let bg = placement.cell?.backgroundColor {
+                block.backgroundColor = bg
+            } else if header {
+                block.backgroundColor = Palette.tableHeaderBg
+            }
+            if let width = placement.cell?.width {
+                block.setContentWidth(width, type: .absoluteValueType)
+            }
             let ps = NSMutableParagraphStyle()
             ps.textBlocks = [block]
             ps.minimumLineHeight = cellLH
