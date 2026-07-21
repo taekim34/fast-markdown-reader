@@ -38,6 +38,20 @@
 			<key>NSDocumentClass</key>
 			<string>FastMDReader.MarkdownDocument</string>
 		</dict>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Word Document</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>org.openxmlformats.wordprocessingml.document</string>
+			</array>
+			<key>NSDocumentClass</key>
+			<string>FastMDReader.MarkdownDocument</string>
+		</dict>
 	</array>
 	<key>CFBundleExecutable</key>
 	<string>FastMDReader</string>

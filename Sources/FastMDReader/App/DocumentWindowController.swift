@@ -889,6 +889,9 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
     /// popup; on save, replace just that source span and re-render (Notion-style block editing).
     func editSelectedSource(atChar: Int? = nil) {
         guard let storage = textView.textStorage, let doc = document as? MarkdownDocument else { return }
+        // An office document has no editable source (see `isOfficeDocument`/CLAUDE.md invariant
+        // 22) — refuse explicitly rather than rely on the srcRange scan below coming up empty.
+        guard doc.kind != .office else { NSSound.beep(); return }
         // Nothing to edit yet — treat Edit on an empty document as writing its first block, rather
         // than beeping at someone who is trying to start.
         guard storage.length > 0 else { addBlockBelow(atChar: nil); return }
@@ -931,11 +934,20 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
     /// clicked block, reusing that document's own separator (blank line in markdown, single
     /// newline in a plain text file).
     func addBlockBelow(atChar char: Int?) {
+        guard let doc = document as? MarkdownDocument else { NSSound.beep(); return }
+        // An office document has no editable source (see `isOfficeDocument`/CLAUDE.md invariant
+        // 22). This guard must come BEFORE the "empty document" branch below: an office document's
+        // `text` is always "" and carries no `srcRange`, so `blockContext` is always nil for it —
+        // which the branch below would otherwise read as "empty document, start typing" and
+        // overwrite `doc.text` (harmlessly empty here, but dirtying the document over content the
+        // reader never touched — the real bug this sprint's audit found).
+        guard doc.kind != .office else { NSSound.beep(); return }
         // An EMPTY document has no blocks to add below, and without this it had no way in at all:
         // every editing route resolves a block first, so a new tab was a document you could never
-        // put anything into. Here the first block simply becomes the document.
-        if blockContext(atChar: char) == nil {
-            guard let doc = document as? MarkdownDocument else { NSSound.beep(); return }
+        // put anything into. Here the first block simply becomes the document. Tested directly on
+        // `doc.text`, NOT on `blockContext == nil` — a nil block context means "no srcRange at this
+        // anchor", which is not the same claim as "the document is empty" (see the guard above).
+        if doc.text.isEmpty {
             SourceEditPanel.show(title: doc.isPlainText ? "New line" : "New block", markdown: "") { added in
                 guard !added.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
                 let whole = NSRange(location: 0, length: (doc.text as NSString).length)

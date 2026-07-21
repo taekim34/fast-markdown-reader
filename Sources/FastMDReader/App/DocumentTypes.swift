@@ -14,9 +14,22 @@ enum DocumentTypes {
     /// doesn't keep — it has no syntax view for them, and the file's real editor is a better answer.
     static let plainTextExtensions = ["txt", "text", "csv", "tsv", "log", "conf", "cfg", "ini", "env"]
 
+    /// Office formats, read-only (see invariants 22 and CLAUDE.md S4). Only `.docx` this sprint —
+    /// `.odt`/`.rtf` arrive in S6, and adding them here without a reader behind them would offer a
+    /// file the panel can't actually open.
+    static let officeExtensions = ["docx"]
+
     static func opensInApp(_ ext: String) -> Bool {
         let e = ext.lowercased()
-        return markdownExtensions.contains(e) || plainTextExtensions.contains(e)
+        return markdownExtensions.contains(e) || plainTextExtensions.contains(e) || officeExtensions.contains(e)
+    }
+
+    /// The 3-way fork every render/edit decision is made from — see `DocumentKind`.
+    static func kind(forExtension ext: String) -> DocumentKind {
+        let e = ext.lowercased()
+        if markdownExtensions.contains(e) { return .markdown }
+        if officeExtensions.contains(e) { return .office }
+        return .plainText
     }
 
     /// Content types for the Open panel's filter.
@@ -30,6 +43,20 @@ enum DocumentTypes {
         types.append(contentsOf: plainTextExtensions.compactMap {
             UTType(filenameExtension: $0, conformingTo: .plainText)
         })
+        types.append(contentsOf: officeExtensions.compactMap { UTType(filenameExtension: $0) })
         return types
     }
+}
+
+/// What kind of document is open — the fork every render/edit decision is made from.
+/// Replaces a bare `isPlainText` boolean, which was really "not markdown": a `.docx` satisfied it,
+/// which is exactly what routed office bytes into `PlainTextRenderer` before this existed (see
+/// CLAUDE.md invariant list, S4 amendment A).
+enum DocumentKind {
+    case markdown
+    case plainText
+    /// Word/ODF/RTF, rendered read-only through `Render/Office`. No `srcRange` is ever emitted for
+    /// these (see the S4 audit in the roadmap) — the edit surface is gated shut by kind, not by a
+    /// synthetic source range.
+    case office
 }

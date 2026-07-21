@@ -4,6 +4,12 @@ import ImageIO
 final class MarkdownDocument: NSDocument {
     private(set) var text: String = ""
 
+    /// The office reader's output (`.docx` etc — see `Render/Office`). Blocks, not a finished
+    /// attributed string: `render(into:)` re-runs `OfficeTextBuilder.build` every time (font-size
+    /// change, ⌘R), so a cached string would freeze the document at whatever size it was built at.
+    /// Empty for every other kind.
+    private(set) var officeBlocks: [OfficeBlock] = []
+
     // C3: bumped on every full render; async mermaid swaps from a previous render carry
     // a stale generation and abort before mutating, so only the latest render wins.
     private var renderGeneration = 0
@@ -30,6 +36,18 @@ final class MarkdownDocument: NSDocument {
     /// Change tracking is left to NSDocument, which watches the undo manager — undo back to the
     /// original state correctly reports the document as clean again.
     override func data(ofType typeName: String) throws -> Data {
+        // Office documents have no editable source (invariant: `text` stays "" for them — see
+        // `read(from:ofType:)`) — refuse rather than write an empty file over a real one. This is
+        // the only writer (`applySourceEdit` never runs for `.office`; see the kind gates in
+        // `ReaderTextView` and `DocumentWindowController`), so refusing here closes the door for
+        // every path at once.
+        guard kind != .office else {
+            throw NSError(domain: "ai.ww-w.fast-md-reader", code: 2, userInfo: [
+                NSLocalizedDescriptionKey: "This document is read-only and can't be saved.",
+                NSLocalizedRecoverySuggestionErrorKey:
+                    "\(fileURL?.lastPathComponent ?? "This file") is a format fast-md-reader only reads, not edits.",
+            ])
+        }
         guard let bytes = TextEncodingDetector.encode(text, like: file) else {
             throw NSError(domain: "ai.ww-w.fast-md-reader", code: 1, userInfo: [
                 NSLocalizedDescriptionKey: "This file's text encoding can't represent some of the characters in your edits.",
@@ -45,11 +63,23 @@ final class MarkdownDocument: NSDocument {
     private(set) var file = TextFile(text: "", encoding: .utf8, hasBOM: false)
 
     override func read(from data: Data, ofType typeName: String) throws {
-        // NOT `String(decoding:as: UTF8.self)`: that never fails, it just substitutes replacement
-        // characters, so a Windows-made CP949 or UTF-16 file arrives as a wall of "?" and looks
-        // corrupted. The detector reads the bytes for what they are.
-        self.file = TextEncodingDetector.decode(data)
-        self.text = file.text
+        // An office document is a binary ZIP container, not text — `TextEncodingDetector` is a
+        // text-encoding detector, and running it over these bytes would be nonsense (best case,
+        // garbage; worst case a false "valid encoding" match). Parse the archive instead, and
+        // THROW on failure rather than opening an empty window (see `DocxReader.ReadError`) — an
+        // empty office document would look like a genuinely blank file, the worst failure mode.
+        guard kind == .office else {
+            // NOT `String(decoding:as: UTF8.self)`: that never fails, it just substitutes
+            // replacement characters, so a Windows-made CP949 or UTF-16 file arrives as a wall of
+            // "?" and looks corrupted. The detector reads the bytes for what they are.
+            self.file = TextEncodingDetector.decode(data)
+            self.text = file.text
+            return
+        }
+        let archive = try ZipArchive(data: data)
+        self.officeBlocks = try DocxReader.read(archive)
+        self.text = ""
+        self.file = TextFile(text: "", encoding: .utf8, hasBOM: false)
     }
 
     override func makeWindowControllers() {
@@ -80,15 +110,25 @@ final class MarkdownDocument: NSDocument {
             guard a.runModal() == .alertFirstButtonReturn else { return }
         }
         if let url = fileURL, let data = try? Data(contentsOf: url) {
-            let reread = TextEncodingDetector.decode(data)
-            // The undo stack holds source OFFSETS into the text we're replacing. Re-reading the file
-            // can move every one of them (the file may have changed behind us), so an undo applied
-            // afterwards would overwrite the wrong span. Drop the history rather than corrupt the file.
-            // Compared as TEXT, not bytes: re-encoding is not a change the user made.
-            if reread.text != self.text { undoManager?.removeAllActions() }
-            self.file = reread
-            self.text = reread.text
-            updateChangeCount(.changeCleared)     // the document now matches the file again
+            if kind == .office {
+                // Re-parse the archive, same as the initial read — never through the text-decode
+                // path (invariant: an office document's bytes are never handed to
+                // `TextEncodingDetector`).
+                if let archive = try? ZipArchive(data: data), let blocks = try? DocxReader.read(archive) {
+                    officeBlocks = blocks
+                }
+            } else {
+                let reread = TextEncodingDetector.decode(data)
+                // The undo stack holds source OFFSETS into the text we're replacing. Re-reading the
+                // file can move every one of them (the file may have changed behind us), so an undo
+                // applied afterwards would overwrite the wrong span. Drop the history rather than
+                // corrupt the file. Compared as TEXT, not bytes: re-encoding is not a change the
+                // user made.
+                if reread.text != self.text { undoManager?.removeAllActions() }
+                self.file = reread
+                self.text = reread.text
+                updateChangeCount(.changeCleared)     // the document now matches the file again
+            }
         }
         guard let wc = windowControllers.first as? DocumentWindowController else { return }
         let anchor = wc.topVisibleCharIndex()
@@ -157,7 +197,11 @@ final class MarkdownDocument: NSDocument {
     private func spliceRender(into wc: DocumentWindowController, editedSource r: NSRange,
                               replacementLength: Int) -> Bool {
         guard let storage = wc.textStorageRef, storage.length > 0 else { return false }
-        if !isPlainText && hasCrossBlockReferences { return false }
+        // An office document has no source text to splice a substring out of — `text` is "" for
+        // these (see `read(from:ofType:)`) — and it never reaches here anyway, since every path
+        // that calls `applySourceEdit` is gated shut for `.office`. Refuse rather than assume.
+        guard kind != .office else { return false }
+        if kind == .markdown && hasCrossBlockReferences { return false }
 
         let spans = BlockEdit.spans(in: storage)          // spans of the text BEFORE this edit
         guard let first = BlockEdit.indexOfBlock(containing: r.location, in: spans) else { return false }
@@ -189,8 +233,8 @@ final class MarkdownDocument: NSDocument {
         let theme = RenderTheme.current(size: FontSizeStore.size)
         let fragmentSource = ns.substring(with: NSRange(location: oldStart, length: newLength))
         let fragment = NSMutableAttributedString(attributedString:
-            isPlainText ? PlainTextRenderer.render(fragmentSource, theme: theme)
-                        : MarkdownRenderer.render(fragmentSource, theme: theme))
+            kind == .plainText ? PlainTextRenderer.render(fragmentSource, theme: theme)
+                               : MarkdownRenderer.render(fragmentSource, theme: theme))
         // A fragment is rendered from position zero, so its source offsets and block ids are local.
         // Lift both into the document's coordinates before it goes in.
         rebase(fragment, sourceOffset: oldStart, idBase: blockIdBase)
@@ -305,14 +349,18 @@ final class MarkdownDocument: NSDocument {
         }
     }
 
-    /// True for a file this app opens as TEXT rather than markdown (.txt, .csv, .log, …). Decided
-    /// by extension, not content: a `.txt` full of `#` and `*` is a text file whose author wanted
-    /// those characters on the page, and guessing otherwise would rewrite what they see.
-    /// Markdown extensions are the allowlist; everything else that reaches us is plain.
-    var isPlainText: Bool {
-        let ext = (fileURL?.pathExtension ?? untitledExtension ?? "md").lowercased()
-        return !["md", "markdown", "mdown", "mkd", "mdtext"].contains(ext) && !ext.isEmpty
+    /// The 3-way fork every render/edit decision is made from. Decided by extension, not content
+    /// (a `.txt` full of `#` and `*` is a text file whose author wanted those characters on the
+    /// page, and guessing otherwise would rewrite what they see) — `untitledExtension` answers the
+    /// question for a document that has no file yet.
+    var kind: DocumentKind {
+        DocumentTypes.kind(forExtension: fileURL?.pathExtension ?? untitledExtension ?? "md")
     }
+
+    /// True for a file this app opens as TEXT rather than markdown or a rendered office document
+    /// (.txt, .csv, .log, …). Kept as the boolean callers already use for wording ("line" vs
+    /// "block") and the plain-text render fork — `kind` is the one place that actually decides.
+    var isPlainText: Bool { kind == .plainText }
 
     /// What a NEW document is, before it has a file to be judged by. Nil for anything read from
     /// disk, where the path answers the question.
@@ -349,8 +397,15 @@ final class MarkdownDocument: NSDocument {
     private func render(into wc: DocumentWindowController) {
         // FontSizeStore is the SINGLE owner of font size — never read UserDefaults directly.
         let theme = RenderTheme.current(size: FontSizeStore.size)
-        let attr = isPlainText ? PlainTextRenderer.render(text, theme: theme)
-                               : MarkdownRenderer.render(text, theme: theme)
+        let attr: NSAttributedString
+        switch kind {
+        case .plainText: attr = PlainTextRenderer.render(text, theme: theme)
+        case .markdown: attr = MarkdownRenderer.render(text, theme: theme)
+        // Rebuilt from blocks every render, not cached: a font-size change (⌘+/⌘−) or ⌘R must
+        // reflow office text exactly like markdown does — a finished string would freeze the
+        // document at whatever size it was first opened at.
+        case .office: attr = OfficeTextBuilder.build(officeBlocks, theme: theme)
+        }
         wc.display(attr)
         wc.window?.title = displayName ?? "fast-md-reader"
         renderGeneration += 1

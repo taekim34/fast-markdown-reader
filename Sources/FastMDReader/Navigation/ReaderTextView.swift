@@ -115,11 +115,13 @@ final class ReaderTextView: NSTextView {
            let key = event.charactersIgnoringModifiers?.lowercased(), key.count == 1 {
             let caret = selectedRange().location
             switch key {
-            case "e": wc.editSelectedSource(atChar: caret); return
-            case "i": wc.addBlockBelow(atChar: caret); return
-            case "d": wc.deleteBlock(atChar: caret); return
-            case "u": wc.moveBlockUnderCaret(by: -1); return
-            case "j": wc.moveBlockUnderCaret(by: 1); return
+            // No editable source on an office document — see `isOfficeDocument`. The context-menu
+            // gate alone would be cosmetic: these bare keys reach the same actions without it.
+            case "e" where !isOfficeDocument: wc.editSelectedSource(atChar: caret); return
+            case "i" where !isOfficeDocument: wc.addBlockBelow(atChar: caret); return
+            case "d" where !isOfficeDocument: wc.deleteBlock(atChar: caret); return
+            case "u" where !isOfficeDocument: wc.moveBlockUnderCaret(by: -1); return
+            case "j" where !isOfficeDocument: wc.moveBlockUnderCaret(by: 1); return
             case "t": wc.toggleTableOfContents(nil); return
             default: break
             }
@@ -272,16 +274,21 @@ final class ReaderTextView: NSTextView {
         // after it, move it, remove it. Delete sits with the others (it IS a block operation) and
         // earns its safety from the confirmation, not from being set apart. All four work without
         // a selection — each grabs the block under the pointer.
-        addSectionHeader(unitNoun + " Actions", to: menu)
-        // The single-letter keys are shown here because a shortcut nobody can see is a shortcut
-        // nobody uses. They apply to the block under the reading cursor; the menu applies to the
-        // block under the pointer — the same action either way.
-        add("Edit…", symbol: "square.and.pencil", action: #selector(editSelectionMenu(_:)), to: menu, key: "e")
-        add("Add Below…", symbol: "plus.square", action: #selector(addBlockMenu(_:)), to: menu, key: "i")
-        add("Move Up", symbol: "arrow.up", action: #selector(moveUpMenu(_:)), to: menu, key: "u")
-        add("Move Down", symbol: "arrow.down", action: #selector(moveDownMenu(_:)), to: menu, key: "j")
-        add("Delete…", symbol: "trash", action: #selector(deleteBlockMenu(_:)), to: menu, key: "d")
-        menu.addItem(.separator())
+        //
+        // None of this applies to an office document — it has no editable source, so the block
+        // surface is left out of the menu entirely rather than shown and made to do nothing.
+        if !isOfficeDocument {
+            addSectionHeader(unitNoun + " Actions", to: menu)
+            // The single-letter keys are shown here because a shortcut nobody can see is a shortcut
+            // nobody uses. They apply to the block under the reading cursor; the menu applies to the
+            // block under the pointer — the same action either way.
+            add("Edit…", symbol: "square.and.pencil", action: #selector(editSelectionMenu(_:)), to: menu, key: "e")
+            add("Add Below…", symbol: "plus.square", action: #selector(addBlockMenu(_:)), to: menu, key: "i")
+            add("Move Up", symbol: "arrow.up", action: #selector(moveUpMenu(_:)), to: menu, key: "u")
+            add("Move Down", symbol: "arrow.down", action: #selector(moveDownMenu(_:)), to: menu, key: "j")
+            add("Delete…", symbol: "trash", action: #selector(deleteBlockMenu(_:)), to: menu, key: "d")
+            menu.addItem(.separator())
+        }
         addSectionHeader("Document", to: menu)
         add("Select All", symbol: "square.dashed", action: #selector(selectAll(_:)), to: menu)
         return menu
@@ -294,6 +301,13 @@ final class ReaderTextView: NSTextView {
     private var unitNoun: String {
         let doc = (window?.windowController as? DocumentWindowController)?.document as? MarkdownDocument
         return (doc?.isPlainText ?? false) ? "Line" : "Block"
+    }
+
+    /// An office document (`.docx`, …) has no editable source — see CLAUDE.md invariant 22 and the
+    /// S4 audit in `docs/plans/2026-07-21-office-reader-roadmap.md`. Every edit door checks this.
+    private var isOfficeDocument: Bool {
+        let doc = (window?.windowController as? DocumentWindowController)?.document as? MarkdownDocument
+        return doc?.kind == .office
     }
 
     /// One menu item with its icon. Every action here — ours and NSTextView's own `copy:` /
