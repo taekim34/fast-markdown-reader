@@ -46,7 +46,7 @@ final class OfficeTextBuilderTests: XCTestCase {
             .heading(level: 1, spans: [span("Title")]),
             .paragraph(spans: [span("Body")]),
             .listItem(level: 0, ordered: false, spans: [span("Item")]),
-            .table(rows: [[[span("A")], [span("B")]]], headerRows: 0),
+            .table(rows: [[Cell(spans: [span("A")]), Cell(spans: [span("B")])]], headerRows: 0),
             .image(id: "img1", size: CGSize(width: 100, height: 80)),
         ]
         let out = build(blocks)
@@ -249,9 +249,9 @@ final class OfficeTextBuilderTests: XCTestCase {
     /// empty cell still occupies its `NSTextTableBlock`, it doesn't collapse the row or shift the
     /// remaining column. `headerRows: 1` is today's asserted shape behaviour, kept as-is.
     func testTableWithHeaderRowAndAnEmptyCellKeepsItsRowAndColumnShape() {
-        let rows: [[[Span]]] = [
-            [[span("Name")], [span("Score")]],
-            [[], [span("42")]],
+        let rows: [[Cell]] = [
+            [Cell(spans: [span("Name")]), Cell(spans: [span("Score")])],
+            [Cell(spans: []), Cell(spans: [span("42")])],
         ]
         let out = build([.table(rows: rows, headerRows: 1)])
         let blocks = tableBlocks(in: out)
@@ -263,9 +263,9 @@ final class OfficeTextBuilderTests: XCTestCase {
     /// Same shape guarantee with NO header row at all — a headerless table (the common case in the
     /// real contract test set) must not collapse a column just because row 0 isn't styled.
     func testTableWithNoHeaderAndAnEmptyCellKeepsItsRowAndColumnShape() {
-        let rows: [[[Span]]] = [
-            [[], [span("42")]],
-            [[span("Name")], [span("Score")]],
+        let rows: [[Cell]] = [
+            [Cell(spans: []), Cell(spans: [span("42")])],
+            [Cell(spans: [span("Name")]), Cell(spans: [span("Score")])],
         ]
         let out = build([.table(rows: rows, headerRows: 0)])
         let blocks = tableBlocks(in: out)
@@ -275,7 +275,10 @@ final class OfficeTextBuilderTests: XCTestCase {
     }
 
     func testTableHeaderRowIsShadedWithThemeHeaderBackground() {
-        let out = build([.table(rows: [[[span("H1")], [span("H2")]], [[span("v1")], [span("v2")]]], headerRows: 1)])
+        let out = build([.table(rows: [
+            [Cell(spans: [span("H1")]), Cell(spans: [span("H2")])],
+            [Cell(spans: [span("v1")]), Cell(spans: [span("v2")])],
+        ], headerRows: 1)])
         let blocks = tableBlocks(in: out)
         let headerBgs = blocks.filter { $0.startingRow == 0 }.compactMap(\.backgroundColor)
         XCTAssertEqual(headerBgs.count, 2)
@@ -288,7 +291,10 @@ final class OfficeTextBuilderTests: XCTestCase {
     /// no bold, no header shading. Defaulting this to look like a header would misrepresent a
     /// document that never had one (see `OfficeBlock.table`).
     func testHeaderRowsZeroRendersFirstRowWithPlainBodyAttributes() {
-        let out = build([.table(rows: [[[span("H1")], [span("H2")]], [[span("v1")], [span("v2")]]], headerRows: 0)])
+        let out = build([.table(rows: [
+            [Cell(spans: [span("H1")]), Cell(spans: [span("H2")])],
+            [Cell(spans: [span("v1")]), Cell(spans: [span("v2")])],
+        ], headerRows: 0)])
         let font = out.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
         XCTAssertFalse(font!.fontDescriptor.symbolicTraits.contains(.bold), "headerRows: 0 must not bold row 0")
         let blocks = tableBlocks(in: out)
@@ -302,8 +308,8 @@ final class OfficeTextBuilderTests: XCTestCase {
     /// source pipelines feed the cell content), so this compares block STRUCTURE, not the string.
     func testOfficeAndMarkdownTablesWithSameContentProduceStructurallyEquivalentBlocks() {
         let officeOut = build([.table(rows: [
-            [[span("A")], [span("B")]],
-            [[span("1")], [span("2")]],
+            [Cell(spans: [span("A")]), Cell(spans: [span("B")])],
+            [Cell(spans: [span("1")]), Cell(spans: [span("2")])],
         ], headerRows: 1)])
         let markdownOut = MarkdownRenderer.render("| A | B |\n|---|---|\n| 1 | 2 |", theme: theme)
 
@@ -327,6 +333,193 @@ final class OfficeTextBuilderTests: XCTestCase {
         let markdownBorders = Set(markdownBlocks.compactMap { $0.borderColor(for: .minX) })
         XCTAssertEqual(officeBorders, markdownBorders)
         XCTAssertEqual(officeBorders, [Palette.tableBorder])
+    }
+
+    // MARK: Tables — spans (R1-3)
+
+    /// The safety net for the whole R1 change: a table where every `Cell` is left at its default
+    /// `rowSpan`/`colSpan` of 1 must produce the exact block count and shape the pre-R1 rectangular
+    /// grid did — nothing about ordinary tables may change just because spans exist as a concept.
+    func testTableWithAllSpansOneRendersIdenticallyToAPlainGrid() {
+        let rows: [[Cell]] = [
+            [Cell(spans: [span("A")]), Cell(spans: [span("B")]), Cell(spans: [span("C")])],
+            [Cell(spans: [span("1")]), Cell(spans: [span("2")]), Cell(spans: [span("3")])],
+        ]
+        let out = build([.table(rows: rows, headerRows: 1)])
+        let blocks = tableBlocks(in: out)
+        XCTAssertEqual(blocks.count, 6)
+        XCTAssertTrue(blocks.allSatisfy { $0.rowSpan == 1 && $0.columnSpan == 1 })
+        XCTAssertEqual(Set(blocks.filter { $0.startingRow == 0 }.map(\.startingColumn)), [0, 1, 2])
+        XCTAssertEqual(Set(blocks.filter { $0.startingRow == 1 }.map(\.startingColumn)), [0, 1, 2])
+    }
+
+    /// A `colSpan: 2` anchor in a 3-column table must occupy columns 0–1, and the row's next cell
+    /// must land in column 2 — not column 1, which the anchor already covers.
+    func testColSpanTwoOccupiesTwoColumnsAndTheNextCellStartsAfterIt() {
+        let rows: [[Cell]] = [
+            [Cell(spans: [span("wide")], colSpan: 2), Cell(spans: [span("narrow")])],
+        ]
+        let out = build([.table(rows: rows, headerRows: 0)])
+        let blocks = tableBlocks(in: out)
+        XCTAssertEqual(blocks.count, 2)
+        let wide = blocks.first { $0.startingColumn == 0 }
+        let narrow = blocks.first { $0.startingColumn == 2 }
+        XCTAssertEqual(wide?.columnSpan, 2)
+        XCTAssertNotNil(narrow, "the second cell must start at column 2, past the merged span")
+        XCTAssertEqual(narrow?.columnSpan, 1)
+    }
+
+    /// A `rowSpan: 2` anchor must occupy its own row and the one below it; the row below must
+    /// place its OTHER cells in the columns the span doesn't cover, not shifted or dropped.
+    func testRowSpanTwoOccupiesTwoRowsAndTheRowBelowFillsRemainingColumns() {
+        let rows: [[Cell]] = [
+            [Cell(spans: [span("tall")], rowSpan: 2), Cell(spans: [span("top-right")])],
+            [Cell(spans: [span("bottom-right")])],
+        ]
+        let out = build([.table(rows: rows, headerRows: 0)])
+        let blocks = tableBlocks(in: out)
+        XCTAssertEqual(blocks.count, 3)
+        let tall = blocks.first { $0.startingRow == 0 && $0.startingColumn == 0 }
+        XCTAssertEqual(tall?.rowSpan, 2)
+        let bottomRight = blocks.first { $0.startingRow == 1 }
+        XCTAssertEqual(bottomRight?.startingColumn, 1, "row 1's own cell must land in the column the span doesn't cover")
+    }
+
+    /// A row can carry FEWER anchors than the grid is wide — exactly what a Word row looks like once
+    /// its other cells are absorbed by a merge. Every column must still get a block, or the border
+    /// has a hole in it: an unoccupied position with no `NSTextTableBlock` draws nothing at all,
+    /// which reads as a broken table rather than an empty cell. Note this is a SHORT ARRAY, not an
+    /// empty `Cell` — the distinction the padding pass exists for.
+    func testRowWithFewerAnchorsThanTheGridStillDrawsEveryColumn() {
+        let rows: [[Cell]] = [
+            [Cell(spans: [span("A")]), Cell(spans: [span("B")]), Cell(spans: [span("C")])],
+            [Cell(spans: [span("1")])],
+        ]
+        let out = build([.table(rows: rows, headerRows: 0)])
+        let blocks = tableBlocks(in: out)
+        XCTAssertEqual(Set(blocks.filter { $0.startingRow == 1 }.map(\.startingColumn)), [0, 1, 2],
+                       "the short row must still cover all three columns")
+        XCTAssertEqual(blocks.count, 6)
+    }
+
+    /// The other half of that rule: a position covered by another cell's span is OCCUPIED, not empty,
+    /// and must NOT be padded. Padding it would put a second block in one grid position.
+    func testColumnsCoveredByAnEarlierRowsSpanAreNotPadded() {
+        let rows: [[Cell]] = [
+            [Cell(spans: [span("tall")], rowSpan: 2), Cell(spans: [span("top")])],
+            [Cell(spans: [span("bottom")])],
+        ]
+        let out = build([.table(rows: rows, headerRows: 0)])
+        let blocks = tableBlocks(in: out)
+        XCTAssertEqual(blocks.count, 3, "no padding block may be added under the vertical span")
+        let row1 = blocks.filter { $0.startingRow == 1 }
+        XCTAssertEqual(row1.count, 1)
+        XCTAssertEqual(row1.first?.startingColumn, 1)
+    }
+
+    /// A span that reaches the last column leaves nothing to pad.
+    func testColSpanReachingTheLastColumnAddsNoTrailingPadding() {
+        let rows: [[Cell]] = [
+            [Cell(spans: [span("A")]), Cell(spans: [span("B")])],
+            [Cell(spans: [span("wide")], colSpan: 2)],
+        ]
+        let out = build([.table(rows: rows, headerRows: 0)])
+        let blocks = tableBlocks(in: out)
+        XCTAssertEqual(blocks.count, 3)
+        XCTAssertEqual(blocks.filter { $0.startingRow == 1 }.count, 1)
+    }
+
+    /// Spans arrive from a parsed file, so they are untrusted input. A document claiming a cell spans
+    /// a huge number of rows must not turn into that many loop iterations and set insertions — the
+    /// same posture `ZipArchive` takes toward a declared size. The table still renders.
+    func testAbsurdSpanIsClampedRatherThanLoopedOver() {
+        let rows: [[Cell]] = [
+            [Cell(spans: [span("hostile")], rowSpan: 100_000, colSpan: 100_000)],
+        ]
+        let out = build([.table(rows: rows, headerRows: 0)])
+        let blocks = tableBlocks(in: out)
+        XCTAssertEqual(blocks.count, 1)
+        XCTAssertEqual(blocks.first?.rowSpan, TableBlockBuilder.maxSpan)
+        XCTAssertEqual(blocks.first?.columnSpan, TableBlockBuilder.maxSpan)
+    }
+
+    /// A zero or negative span is nonsense but must not vanish the cell or stall the column cursor.
+    func testZeroSpanIsTreatedAsOne() {
+        let rows: [[Cell]] = [
+            [Cell(spans: [span("A")], rowSpan: 0, colSpan: 0), Cell(spans: [span("B")])],
+        ]
+        let out = build([.table(rows: rows, headerRows: 0)])
+        let blocks = tableBlocks(in: out)
+        XCTAssertEqual(blocks.count, 2)
+        XCTAssertEqual(Set(blocks.map(\.startingColumn)), [0, 1], "a zero span must still advance the cursor")
+    }
+
+    /// A merged cell must not disturb header shading: only row 0 is shaded, regardless of a span
+    /// reaching into row 1.
+    func testMergedCellCombinedWithOneHeaderRowStillShadesOnlyTheHeaderRow() {
+        let rows: [[Cell]] = [
+            [Cell(spans: [span("H1")], colSpan: 2)],
+            [Cell(spans: [span("v1")]), Cell(spans: [span("v2")])],
+        ]
+        let out = build([.table(rows: rows, headerRows: 1)])
+        let blocks = tableBlocks(in: out)
+        let headerBgs = blocks.filter { $0.startingRow == 0 }.compactMap(\.backgroundColor)
+        XCTAssertEqual(headerBgs.count, 1)
+        let bodyBgs = blocks.filter { $0.startingRow == 1 }.compactMap(\.backgroundColor)
+        XCTAssertTrue(bodyBgs.isEmpty)
+    }
+
+    // MARK: Span marks (R1-2 / R1-4)
+
+    /// Each new mark must land on exactly its own span's range — the same "no bleed into
+    /// neighbours" contract `testBoldAppliesOnlyToTheBoldSpansRange` already holds bold to.
+    func testStrikethroughSuperscriptAndSubscriptEachRenderOnlyOnTheirOwnRange() {
+        var strike = span("gone"); strike.strikethrough = true
+        var sup = span("note"); sup.superscript = true
+        var sub = span("index"); sub.subscripted = true
+        let out = build([.paragraph(spans: [span("plain "), strike, span(" "), sup, span(" "), sub])])
+        let text = out.string as NSString
+
+        let strikeRange = text.range(of: "gone")
+        XCTAssertEqual(out.attribute(.strikethroughStyle, at: strikeRange.location, effectiveRange: nil) as? Int,
+                       NSUnderlineStyle.single.rawValue)
+        XCTAssertNil(out.attribute(.strikethroughStyle, at: 0, effectiveRange: nil), "plain text must not be struck through")
+
+        let supRange = text.range(of: "note")
+        let plainFont = out.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
+        let supFont = out.attribute(.font, at: supRange.location, effectiveRange: nil) as? NSFont
+        let supOffset = out.attribute(.baselineOffset, at: supRange.location, effectiveRange: nil) as? CGFloat
+        XCTAssertLessThan(supFont!.pointSize, plainFont!.pointSize, "superscript must shrink the glyph")
+        XCTAssertGreaterThan(supOffset ?? 0, 0, "superscript must raise the baseline")
+
+        let subRange = text.range(of: "index")
+        let subFont = out.attribute(.font, at: subRange.location, effectiveRange: nil) as? NSFont
+        let subOffset = out.attribute(.baselineOffset, at: subRange.location, effectiveRange: nil) as? CGFloat
+        XCTAssertLessThan(subFont!.pointSize, plainFont!.pointSize, "subscript must shrink the glyph")
+        XCTAssertLessThan(subOffset ?? 0, 0, "subscript must lower the baseline")
+    }
+
+    /// A linked office span must carry the identical `.foregroundColor`/`.underlineStyle`/`.link`
+    /// treatment a markdown link gets — a reader shouldn't be able to tell which format a link
+    /// came from just by looking at it.
+    func testLinkSpanCarriesTheSameAttributesAMarkdownLinkDoes() {
+        var linked = span("click here"); linked.link = "https://example.com/doc"
+        let officeOut = build([.paragraph(spans: [linked])])
+        let markdownOut = MarkdownRenderer.render("[click here](https://example.com/doc)", theme: theme)
+
+        let officeColor = officeOut.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor
+        let officeUnderline = officeOut.attribute(.underlineStyle, at: 0, effectiveRange: nil) as? Int
+        let officeURL = officeOut.attribute(.link, at: 0, effectiveRange: nil) as? URL
+
+        let mdLoc = (markdownOut.string as NSString).range(of: "click here").location
+        let mdColor = markdownOut.attribute(.foregroundColor, at: mdLoc, effectiveRange: nil) as? NSColor
+        let mdUnderline = markdownOut.attribute(.underlineStyle, at: mdLoc, effectiveRange: nil) as? Int
+        let mdURL = markdownOut.attribute(.link, at: mdLoc, effectiveRange: nil) as? URL
+
+        XCTAssertEqual(officeColor, mdColor)
+        XCTAssertEqual(officeUnderline, mdUnderline)
+        XCTAssertEqual(officeURL, mdURL)
+        XCTAssertEqual(officeURL, URL(string: "https://example.com/doc"))
     }
 
     // MARK: Images

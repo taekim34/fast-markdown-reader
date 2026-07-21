@@ -488,9 +488,12 @@ enum DocxReader {
 
     private static func parseTable(_ tbl: XMLNode) -> OfficeBlock {
         let rowNodes = tbl.children.filter { $0.name == "w:tr" }
-        let rows: [[[Span]]] = rowNodes.map { row in
+        // Every cell is its own anchor at rowSpan/colSpan 1 — this sprint doesn't read
+        // `w:gridSpan`/`w:vMerge` yet (that's R2), so every position is present-and-visible, never
+        // covered by a merge.
+        let rows: [[Cell]] = rowNodes.map { row in
             row.children.filter { $0.name == "w:tc" }.map { cell in
-                cell.children.filter { $0.name == "w:p" }.flatMap { collectSpans(in: $0) }
+                Cell(spans: cell.children.filter { $0.name == "w:p" }.flatMap { collectSpans(in: $0) })
             }
         }
         // Leading run only — a header row can never follow an ordinary one, and the source is

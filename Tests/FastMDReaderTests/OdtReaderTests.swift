@@ -204,8 +204,8 @@ final class OdtReaderTests: XCTestCase {
         </table:table>
         """)
         XCTAssertEqual(blocks, [.table(rows: [
-            [[Span(text: "H1")], [Span(text: "H2")]],
-            [[Span(text: "A1")], []],
+            [Cell(spans: [Span(text: "H1")]), Cell(spans: [Span(text: "H2")])],
+            [Cell(spans: [Span(text: "A1")]), Cell(spans: [])],
         ], headerRows: 0)])
     }
 
@@ -229,8 +229,8 @@ final class OdtReaderTests: XCTestCase {
         </table:table>
         """)
         XCTAssertEqual(blocks, [.table(rows: [
-            [[Span(text: "H1")]],
-            [[Span(text: "A1")]],
+            [Cell(spans: [Span(text: "H1")])],
+            [Cell(spans: [Span(text: "A1")])],
         ], headerRows: 1)])
     }
 
@@ -243,7 +243,7 @@ final class OdtReaderTests: XCTestCase {
         </table:table>
         """)
         XCTAssertEqual(blocks, [.table(rows: [
-            [[Span(text: "X")], [Span(text: "X")], [Span(text: "X")]],
+            [Cell(spans: [Span(text: "X")]), Cell(spans: [Span(text: "X")]), Cell(spans: [Span(text: "X")])],
         ], headerRows: 0)])
     }
 

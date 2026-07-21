@@ -204,7 +204,7 @@ enum OdtReader {
     /// `headerRows == 0`, never a guess of 1 (`OfficeBlock.table`'s own contract: an un-styled
     /// table is a faithful rendering, a wrongly-bolded row is not).
     private static func parseTable(_ table: XMLNode, textStyles: [String: TextStyle]) -> OfficeBlock {
-        var rows: [[[Span]]] = []
+        var rows: [[Cell]] = []
         var headerRows = 0
         for child in table.children {
             switch child.name {
@@ -226,14 +226,14 @@ enum OdtReader {
     /// `table:number-columns-repeated`/`table:number-rows-repeated` count — ignoring it silently
     /// loses columns (a 5-column table where 3 empty trailing cells were collapsed into one would
     /// come back as 3 columns). Both expansions happen here, once, rather than at every caller.
-    private static func expandRow(_ row: XMLNode, textStyles: [String: TextStyle]) -> [[[Span]]] {
+    private static func expandRow(_ row: XMLNode, textStyles: [String: TextStyle]) -> [[Cell]] {
         let rowRepeat = Int(row.attributes["table:number-rows-repeated"] ?? "") ?? 1
-        var cells: [[Span]] = []
+        var cells: [Cell] = []
         for cell in row.children where cell.name == "table:table-cell" {
             let spans = cell.children.filter { $0.name == "text:p" }
                 .flatMap { collectSpans(in: $0, style: TextStyle(), textStyles: textStyles) }
             let colRepeat = Int(cell.attributes["table:number-columns-repeated"] ?? "") ?? 1
-            cells.append(contentsOf: Array(repeating: spans, count: colRepeat))
+            cells.append(contentsOf: Array(repeating: Cell(spans: spans), count: colRepeat))
         }
         return Array(repeating: cells, count: rowRepeat)
     }

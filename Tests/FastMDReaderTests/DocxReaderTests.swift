@@ -302,8 +302,8 @@ final class DocxReaderTests: XCTestCase {
         </w:tbl>
         """)
         XCTAssertEqual(blocks, [.table(rows: [
-            [[Span(text: "H1")], [Span(text: "H2")]],
-            [[Span(text: "A1")], []],
+            [Cell(spans: [Span(text: "H1")]), Cell(spans: [Span(text: "H2")])],
+            [Cell(spans: [Span(text: "A1")]), Cell(spans: [])],
         ], headerRows: 1)])
     }
 
@@ -315,8 +315,8 @@ final class DocxReaderTests: XCTestCase {
         </w:tbl>
         """)
         XCTAssertEqual(blocks, [.table(rows: [
-            [[Span(text: "A")], [Span(text: "B")]],
-            [[Span(text: "C")], [Span(text: "D")]],
+            [Cell(spans: [Span(text: "A")]), Cell(spans: [Span(text: "B")])],
+            [Cell(spans: [Span(text: "C")]), Cell(spans: [Span(text: "D")])],
         ], headerRows: 0)])
     }
 

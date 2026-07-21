@@ -654,9 +654,11 @@ private struct AttributedBuilder: MarkupWalker {
         // replaces the old monospaced "|"-joined text that wrapped into mush. Cell content is
         // rendered inline here so `code`, **bold**, and links work inside cells; the builder only
         // lays already-styled strings into `NSTextTableBlock` cells.
-        func renderRow(_ cells: [Markdown.Table.Cell], header: Bool) -> [NSAttributedString] {
+        // GFM tables never merge cells, so every cell is its own anchor with rowSpan/columnSpan 1
+        // — `TableBlockBuilder.CellContent`'s defaults, unmentioned here.
+        func renderRow(_ cells: [Markdown.Table.Cell], header: Bool) -> [TableBlockBuilder.CellContent] {
             let font = header ? NSFont.systemFont(ofSize: theme.baseFontSize, weight: .semibold) : theme.bodyFont
-            return cells.map { inlineString($0, font: font, color: theme.textColor) }
+            return cells.map { .init(content: inlineString($0, font: font, color: theme.textColor)) }
         }
         var rows = [renderRow(headerCells, header: true)]
         rows.append(contentsOf: bodyRows.map { renderRow($0, header: false) })

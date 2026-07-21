@@ -89,9 +89,33 @@ enum OfficeTextBuilder {
             if span.bold { traits.insert(.bold) }
             if span.italic { traits.insert(.italic) }
             if !traits.isEmpty { font = fontAdding(traits, to: font) }
+            // Super/subscript shrink the font AND shift the baseline — `.superscript` alone isn't
+            // interpreted by TextKit's own drawing, so it wouldn't actually render raised/lowered
+            // here; a smaller font at an offset baseline is what makes it look right on screen.
+            // `superscript`/`subscripted` are mutually exclusive in every real document, but if a
+            // parser ever set both, superscript wins (checked first) rather than the two offsets
+            // cancelling into something illegible.
+            if span.superscript {
+                let raised = font.pointSize * 0.35
+                font = fontScaled(font, by: 0.7)
+                attrs[.baselineOffset] = raised
+            } else if span.subscripted {
+                let lowered = -font.pointSize * 0.15
+                font = fontScaled(font, by: 0.7)
+                attrs[.baselineOffset] = lowered
+            }
             attrs[.font] = font
             attrs[.foregroundColor] = color
             if span.underline { attrs[.underlineStyle] = NSUnderlineStyle.single.rawValue }
+            if span.strikethrough { attrs[.strikethroughStyle] = NSUnderlineStyle.single.rawValue }
+            // Same colour/underline treatment `MarkdownRenderer.inlineFragment`'s `Markdown.Link`
+            // case uses — a link must look and behave identically whether it arrived via markdown
+            // or an office hyperlink, not grow a second visual style.
+            if let link = span.link, let url = URL(string: link) {
+                attrs[.foregroundColor] = theme.linkColor
+                attrs[.underlineStyle] = NSUnderlineStyle.single.rawValue
+                attrs[.link] = url
+            }
             out.append(NSAttributedString(string: span.text, attributes: attrs))
         }
         return out
@@ -104,6 +128,12 @@ enum OfficeTextBuilder {
     private static func fontAdding(_ traits: NSFontDescriptor.SymbolicTraits, to font: NSFont) -> NSFont {
         let d = font.fontDescriptor.withSymbolicTraits(font.fontDescriptor.symbolicTraits.union(traits))
         return NSFont(descriptor: d, size: font.pointSize) ?? font
+    }
+
+    /// Same family, scaled point size — used for super/subscript, which shrink the glyph as well
+    /// as shifting its baseline.
+    private static func fontScaled(_ font: NSFont, by factor: CGFloat) -> NSFont {
+        NSFont(descriptor: font.fontDescriptor, size: (font.pointSize * factor).rounded()) ?? font
     }
 
     // MARK: Paragraph styles
@@ -201,17 +231,20 @@ enum OfficeTextBuilder {
     /// row was a header (see `OfficeBlock.table`; guessing "row one" would misrepresent a
     /// headerless table). A cell shorter than the widest row leaves its trailing columns empty
     /// rather than collapsing the row.
-    private static func appendTable(_ rows: [[[Span]]], headerRows: Int, into result: NSMutableAttributedString,
+    private static func appendTable(_ rows: [[Cell]], headerRows: Int, into result: NSMutableAttributedString,
                                     theme: RenderTheme) {
-        guard (rows.map(\.count).max() ?? 0) > 0 else {
+        guard rows.contains(where: { !$0.isEmpty }) else {
             result.append(NSAttributedString(string: "\n"))
             return
         }
         let headerFont = fontAdding(.bold, to: theme.bodyFont)
-        let cellRows: [[NSAttributedString]] = rows.enumerated().map { r, row in
+        let cellRows: [[TableBlockBuilder.CellContent]] = rows.enumerated().map { r, anchors in
             let isHeader = r < headerRows
-            return row.map { spansAttributedString($0, baseFont: isHeader ? headerFont : theme.bodyFont,
-                                                    baseColor: theme.textColor, theme: theme) }
+            return anchors.map { cell in
+                let content = spansAttributedString(cell.spans, baseFont: isHeader ? headerFont : theme.bodyFont,
+                                                    baseColor: theme.textColor, theme: theme)
+                return TableBlockBuilder.CellContent(content: content, rowSpan: cell.rowSpan, columnSpan: cell.colSpan)
+            }
         }
         result.append(TableBlockBuilder.build(rows: cellRows, headerRows: headerRows, theme: theme))
         result.append(NSAttributedString(string: "\n"))
