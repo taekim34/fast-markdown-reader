@@ -1,0 +1,445 @@
+import Foundation
+import CoreGraphics
+
+/// `.odt` bytes → `[OfficeBlock]`. An ODT is a ZIP holding `content.xml` (the body, required) and
+/// optionally `styles.xml` — this reader consults BOTH for `text:list-style` (bullet vs number per
+/// level) and text-formatting styles, because LibreOffice sometimes defines a list style used by the
+/// body in `styles.xml` rather than `content.xml`'s own `office:automatic-styles`. Sibling of
+/// `DocxReader`, deliberately shaped the same way (same XML-tree approach, same error type, same
+/// span-reassembly, same unresolvable-image convention) so two office readers don't diverge for no
+/// reason — but the underlying markup is different enough that nothing is shared code, only shape.
+enum OdtReader {
+    enum ReadError: Swift.Error, Equatable, LocalizedError {
+        /// `content.xml` is missing from the archive. Returning an empty document here would look
+        /// like a genuinely blank file — the worst failure mode for a reader — so this throws.
+        case missingContentXML
+        /// A required XML part did not parse (malformed XML). Named by its archive path so the
+        /// error is actionable.
+        case malformedXML(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .missingContentXML:
+                return "This .odt file has no content.xml — it may be corrupt."
+            case .malformedXML(let part):
+                return "\"\(part)\" could not be parsed as XML."
+            }
+        }
+    }
+
+    /// This reader emits `.image` blocks — PARSING only. Resolving an emitted id to actual pixels
+    /// (reading the archive entry, drawing a placeholder for an unresolvable one) is a later
+    /// sprint's job, exactly as in `DocxReader`.
+    static func read(_ archive: ZipArchive) throws -> [OfficeBlock] {
+        guard archive.contains("content.xml") else { throw ReadError.missingContentXML }
+        guard let contentRoot = try? buildTree(archive.data(for: "content.xml")) else {
+            throw ReadError.malformedXML("content.xml")
+        }
+        // `styles.xml` is optional and, when present, is a SECOND place list/text styles can live
+        // — a document-level style declared once and reused is exactly what a writer would do, so
+        // both parts are searched and merged (content.xml wins on a name collision, since it is
+        // the part the body actually renders under).
+        var styleRoots = [contentRoot]
+        if archive.contains("styles.xml"), let data = try? archive.data(for: "styles.xml"),
+           let stylesRoot = try? buildTree(data) {
+            styleRoots.append(stylesRoot)
+        }
+        var listStyles: [String: [Int: Bool]] = [:]
+        var textStyles: [String: TextStyle] = [:]
+        for root in styleRoots.reversed() {
+            listStyles.merge(parseListStyles(from: root)) { existing, _ in existing }
+            textStyles.merge(parseTextStyles(from: root)) { existing, _ in existing }
+        }
+        guard let body = contentRoot.firstDescendant("office:text") else { return [] }
+        return parseBody(body, listStyles: listStyles, textStyles: textStyles, archive: archive)
+    }
+
+    // MARK: Text (span) styles — automatic-styles → bold/italic/underline
+
+    private struct TextStyle: Equatable {
+        var bold = false
+        var italic = false
+        var underline = false
+    }
+
+    /// Only `style:family="text"` styles are read — ODF reuses `style:style` for paragraph, table,
+    /// table-cell, graphic and text styles alike, all distinguished by `style:family`; picking up
+    /// the wrong family would collide names (a paragraph style and a text style can share a name).
+    /// A style with no `style:text-properties` at all, or one that declares none of the three
+    /// properties this reader understands, is simply absent from the map — `collectSpans` reads
+    /// that as "no formatting", never a crash.
+    private static func parseTextStyles(from root: XMLNode) -> [String: TextStyle] {
+        var map: [String: TextStyle] = [:]
+        for styleNode in root.allDescendants("style:style") where styleNode.attributes["style:family"] == "text" {
+            guard let name = styleNode.attributes["style:name"], let props = styleNode.child("style:text-properties")
+            else { continue }
+            var style = TextStyle()
+            style.bold = props.attributes["fo:font-weight"] == "bold"
+            style.italic = props.attributes["fo:font-style"] == "italic"
+            if let underline = props.attributes["style:text-underline-style"] { style.underline = underline != "none" }
+            map[name] = style
+        }
+        return map
+    }
+
+    // MARK: List styles — style name → (0-based level → ordered?)
+
+    /// ODF numbers list levels 1-based (`text:level="1"` is the outermost) — converted to the
+    /// 0-based nesting depth `OfficeBlock.listItem.level` already uses, so `isOrdered` never has to
+    /// re-derive the offset. A level with neither a number nor a bullet child (an image-marker
+    /// level, rare but legal) is simply absent, which `isOrdered` reads as unresolvable → bullet.
+    private static func parseListStyles(from root: XMLNode) -> [String: [Int: Bool]] {
+        var map: [String: [Int: Bool]] = [:]
+        for listStyle in root.allDescendants("text:list-style") {
+            guard let name = listStyle.attributes["style:name"] else { continue }
+            var levels: [Int: Bool] = [:]
+            for levelStyle in listStyle.children {
+                guard let levelString = levelStyle.attributes["text:level"], let level = Int(levelString) else { continue }
+                switch levelStyle.name {
+                case "text:list-level-style-number": levels[level - 1] = true
+                case "text:list-level-style-bullet": levels[level - 1] = false
+                default: continue
+                }
+            }
+            map[name] = levels
+        }
+        return map
+    }
+
+    /// Unresolvable input — no style name on the list at all, a style name absent from the table,
+    /// or a level the style doesn't declare — defaults to unordered (a bullet), never ordered: an
+    /// unstyled list is a faithful reading, a fabricated "1. 2. 3." is not (same reasoning as
+    /// `DocxReader.isOrdered`).
+    private static func isOrdered(styleName: String?, level: Int, listStyles: [String: [Int: Bool]]) -> Bool {
+        guard let styleName, let ordered = listStyles[styleName]?[level] else { return false }
+        return ordered
+    }
+
+    // MARK: content.xml — office:text → blocks
+
+    private static func parseBody(
+        _ text: XMLNode, listStyles: [String: [Int: Bool]], textStyles: [String: TextStyle], archive: ZipArchive
+    ) -> [OfficeBlock] {
+        var blocks: [OfficeBlock] = []
+        for child in text.children {
+            switch child.name {
+            case "text:h":
+                let rawLevel = Int(child.attributes["text:outline-level"] ?? "") ?? 1
+                let level = min(max(rawLevel, 1), 6)
+                blocks.append(contentsOf: paragraphLikeBlocks(
+                    child, make: { .heading(level: level, spans: $0) }, textStyles: textStyles, archive: archive))
+            case "text:p":
+                blocks.append(contentsOf: paragraphLikeBlocks(
+                    child, make: { .paragraph(spans: $0) }, textStyles: textStyles, archive: archive))
+            case "text:list":
+                blocks.append(contentsOf: parseList(
+                    child, level: 0, inheritedStyleName: nil, listStyles: listStyles, textStyles: textStyles, archive: archive))
+            case "table:table":
+                blocks.append(parseTable(child, textStyles: textStyles))
+            default:
+                // e.g. `text:sequence-decls`, `office:scripts` reached via a broader search — not
+                // a block. `office:text`'s own children never include those, but this stays
+                // defensive against a producer that nests differently.
+                continue
+            }
+        }
+        return blocks
+    }
+
+    /// A heading or paragraph normally contributes exactly one text block, but one carrying an
+    /// image contributes that text block (if it has any spans) FOLLOWED BY the image block(s), in
+    /// source order — mirroring `DocxReader.parseParagraph`. A paragraph that is ONLY a picture
+    /// (no spans at all — LibreOffice puts an image-only paragraph with no other text) contributes
+    /// no empty text block, so callers never see a phantom `.paragraph(spans: [])` standing in for
+    /// a picture.
+    private static func paragraphLikeBlocks(
+        _ node: XMLNode, make: ([Span]) -> OfficeBlock, textStyles: [String: TextStyle], archive: ZipArchive
+    ) -> [OfficeBlock] {
+        let spans = collectSpans(in: node, style: TextStyle(), textStyles: textStyles)
+        let images = collectImages(in: node, archive: archive)
+        var blocks: [OfficeBlock] = []
+        if !(spans.isEmpty && !images.isEmpty) { blocks.append(make(spans)) }
+        blocks.append(contentsOf: images)
+        return blocks
+    }
+
+    // MARK: Lists — text:list > text:list-item > text:p, nested by nesting text:list
+
+    /// Walks one list's items. Each item may hold ordinary paragraph content (`text:p`) and/or a
+    /// nested list (`text:list`, recursing at `level + 1`) — ODF allows either or both. A nested
+    /// list with no `text:style-name` of its own inherits the ENCLOSING list's style name (Writer
+    /// commonly leaves it unstated for a plain continuation), rather than falling straight to
+    /// unordered, which would wrongly flip a nested bullet under a numbered list to a bullet purely
+    /// because the inner element omitted a redundant attribute.
+    private static func parseList(
+        _ list: XMLNode, level: Int, inheritedStyleName: String?, listStyles: [String: [Int: Bool]],
+        textStyles: [String: TextStyle], archive: ZipArchive
+    ) -> [OfficeBlock] {
+        let styleName = list.attributes["text:style-name"] ?? inheritedStyleName
+        let ordered = isOrdered(styleName: styleName, level: level, listStyles: listStyles)
+        var blocks: [OfficeBlock] = []
+        for item in list.children where item.name == "text:list-item" {
+            for child in item.children {
+                switch child.name {
+                case "text:p":
+                    blocks.append(contentsOf: paragraphLikeBlocks(
+                        child, make: { .listItem(level: level, ordered: ordered, spans: $0) },
+                        textStyles: textStyles, archive: archive))
+                case "text:list":
+                    blocks.append(contentsOf: parseList(
+                        child, level: level + 1, inheritedStyleName: styleName, listStyles: listStyles,
+                        textStyles: textStyles, archive: archive))
+                default:
+                    continue
+                }
+            }
+        }
+        return blocks
+    }
+
+    // MARK: Tables — table:table > table:table-row > table:table-cell
+
+    /// `table:table-header-rows` is a WRAPPER element around the leading header rows, not a
+    /// per-row flag the way docx's `w:tblHeader` is — its absence (this fixture has none) means
+    /// `headerRows == 0`, never a guess of 1 (`OfficeBlock.table`'s own contract: an un-styled
+    /// table is a faithful rendering, a wrongly-bolded row is not).
+    private static func parseTable(_ table: XMLNode, textStyles: [String: TextStyle]) -> OfficeBlock {
+        var rows: [[[Span]]] = []
+        var headerRows = 0
+        for child in table.children {
+            switch child.name {
+            case "table:table-header-rows":
+                let expanded = child.children.filter { $0.name == "table:table-row" }
+                    .flatMap { expandRow($0, textStyles: textStyles) }
+                headerRows += expanded.count
+                rows.append(contentsOf: expanded)
+            case "table:table-row":
+                rows.append(contentsOf: expandRow(child, textStyles: textStyles))
+            default:
+                continue
+            }
+        }
+        return .table(rows: rows, headerRows: headerRows)
+    }
+
+    /// ODF collapses runs of identical adjacent cells/rows into one element carrying a
+    /// `table:number-columns-repeated`/`table:number-rows-repeated` count — ignoring it silently
+    /// loses columns (a 5-column table where 3 empty trailing cells were collapsed into one would
+    /// come back as 3 columns). Both expansions happen here, once, rather than at every caller.
+    private static func expandRow(_ row: XMLNode, textStyles: [String: TextStyle]) -> [[[Span]]] {
+        let rowRepeat = Int(row.attributes["table:number-rows-repeated"] ?? "") ?? 1
+        var cells: [[Span]] = []
+        for cell in row.children where cell.name == "table:table-cell" {
+            let spans = cell.children.filter { $0.name == "text:p" }
+                .flatMap { collectSpans(in: $0, style: TextStyle(), textStyles: textStyles) }
+            let colRepeat = Int(cell.attributes["table:number-columns-repeated"] ?? "") ?? 1
+            cells.append(contentsOf: Array(repeating: spans, count: colRepeat))
+        }
+        return Array(repeating: cells, count: rowRepeat)
+    }
+
+    // MARK: Images — draw:frame > draw:image
+
+    /// `svg:width`/`svg:height` on the FRAME (not the image) is the declared, authoritative drawn
+    /// size — same reasoning as amendment D in the roadmap: a raster placed at a given frame size
+    /// is displayed there regardless of its pixel dimensions. Every `draw:frame` with a
+    /// `draw:image` child anywhere below `node` is collected, not just a direct child, since a
+    /// frame can itself be wrapped (e.g. inside `draw:text-box`) — mirrors `DocxReader`'s
+    /// `allDescendants("a:blip")` walk for the same reason: an image must never be dropped just
+    /// because of an intermediate wrapper this reader doesn't specifically name.
+    private static func collectImages(in node: XMLNode, archive: ZipArchive) -> [OfficeBlock] {
+        node.allDescendants("draw:frame").compactMap { frame in
+            guard let image = frame.child("draw:image") else { return nil }
+            let width = frame.attributes["svg:width"].flatMap(parseLength)
+            let height = frame.attributes["svg:height"].flatMap(parseLength)
+            let size = CGSize(width: width ?? unresolvedFrameSize.width, height: height ?? unresolvedFrameSize.height)
+            return .image(id: resolveImageId(href: image.attributes["xlink:href"], archive: archive), size: size)
+        }
+    }
+
+    /// A best-defensible non-zero fallback for a frame whose `svg:width`/`svg:height` is missing or
+    /// doesn't parse — invariant 1 applies here exactly as it does to `DocxReader`'s VML fallback:
+    /// never reserve a zero/collapsed area.
+    private static let unresolvedFrameSize = CGSize(width: 72, height: 72)
+
+    /// An `xlink:href` resolves to the archive entry path when it names a real entry (the ordinary
+    /// case: `"Pictures/…"`, an embedded image) — anything else this reader can't hand pixels for
+    /// (no href at all, or a linked/external href that never was extracted into the archive, e.g.
+    /// an absolute `file:///…`) resolves to a clearly-marked, non-archive-shaped id. Mirrors
+    /// `DocxReader.resolveId`, prefixed `"odt-"` rather than `"docx-"` since the two formats'
+    /// unresolvable ids are never compared against each other — only ever matched by prefix within
+    /// their own reader's caller.
+    private static func resolveImageId(href: String?, archive: ZipArchive) -> String {
+        guard let href else { return unresolvableId("no-href") }
+        guard archive.contains(href) else { return unresolvableId(href) }
+        return href
+    }
+
+    private static func unresolvableId(_ reason: String) -> String { "odt-unresolvable:\(reason)" }
+
+    /// A CSS-like length (`"7.938cm"`, `"1in"`, a bare `"72"`) → points. Longest-suffix-first is
+    /// unnecessary here (no unit is a prefix of another), kept in a table for the same
+    /// self-evident-order-independence reason as `DocxReader.parseCSSLikeLength`. A bare number
+    /// (no unit) is treated as points, ODF's own convention for `style:*-margin`/similar unmarked
+    /// lengths elsewhere in the format.
+    private static func parseLength(_ raw: String) -> CGFloat? {
+        let pointsPerUnit: [(suffix: String, factor: Double)] = [
+            ("cm", 72 / 2.54), ("mm", 72 / 25.4), ("in", 72), ("pc", 12), ("pt", 1), ("px", 0.75),
+        ]
+        for (suffix, factor) in pointsPerUnit where raw.hasSuffix(suffix) {
+            guard let number = Double(raw.dropLast(suffix.count)) else { return nil }
+            return CGFloat(number * factor)
+        }
+        guard let number = Double(raw) else { return nil }
+        return CGFloat(number)
+    }
+
+    // MARK: Spans — text:span/text:a/text:s/text:tab/text:line-break, in document order
+
+    /// Walks `node`'s children strictly in document order (see `XMLNode`/`#text` below — unlike a
+    /// plain "attributes + children" tree, character data is threaded in as ordered pseudo-children
+    /// so `"before "` / `<text:span>bold</text:span>` / `" after"` reassemble in the right order,
+    /// which a tree that only concatenates trailing text per element cannot do). `style` is the
+    /// formatting in effect for any bare text reached at this level; a `text:span` resolves ITS
+    /// OWN style from `text:style-name` (falling back to the inherited `style` when the name is
+    /// absent or unresolvable — text is never dropped for want of a style) and passes that down to
+    /// its own children, so nesting narrows rather than resets formatting.
+    private static func collectSpans(in node: XMLNode, style: TextStyle, textStyles: [String: TextStyle]) -> [Span] {
+        var spans: [Span] = []
+        func appendMerging(_ text: String, _ style: TextStyle) {
+            guard !text.isEmpty else { return }
+            if let last = spans.last, last.bold == style.bold, last.italic == style.italic, last.underline == style.underline {
+                spans[spans.count - 1].text += text
+            } else {
+                spans.append(Span(text: text, bold: style.bold, italic: style.italic, underline: style.underline))
+            }
+        }
+        func walk(_ node: XMLNode, style: TextStyle) {
+            for child in node.children {
+                switch child.name {
+                case "#text":
+                    appendMerging(child.text, style)
+                case "text:span":
+                    let childStyle = child.attributes["text:style-name"].flatMap { textStyles[$0] } ?? style
+                    walk(child, style: childStyle)
+                case "text:s":
+                    let count = child.attributes["text:c"].flatMap(Int.init) ?? 1
+                    appendMerging(String(repeating: " ", count: count), style)
+                case "text:tab":
+                    appendMerging("\t", style)
+                case "text:line-break":
+                    appendMerging("\n", style)
+                case "draw:frame":
+                    continue // images are collected separately by `collectImages`
+                case "text:bookmark-start", "text:bookmark-end", "text:bookmark", "office:annotation",
+                     "office:annotation-end", "text:soft-page-break":
+                    continue // markers with no renderable text of their own
+                default:
+                    // `text:a` (hyperlink) and anything else this switch doesn't specifically name
+                    // is descended into rather than skipped, so text is never lost just because
+                    // ODF wrapped it in something unanticipated — same permissive-recursion
+                    // reasoning as `DocxReader.collectSpans`.
+                    walk(child, style: style)
+                }
+            }
+        }
+        walk(node, style: style)
+        return spans
+    }
+
+    // MARK: Generic XML tree — text threaded in as ordered `"#text"` pseudo-children
+
+    private static func buildTree(_ data: Data) throws -> XMLNode {
+        let delegate = XMLTreeBuilder()
+        let parser = XMLParser(data: data)
+        parser.delegate = delegate
+        guard parser.parse(), let root = delegate.root else {
+            throw ReadError.malformedXML("xml")
+        }
+        return root
+    }
+}
+
+/// A minimal DOM, like `DocxReader`'s own, but with one deliberate difference: character data
+/// becomes an ordinary child node named `"#text"` instead of accumulating in a separate `text`
+/// property on its parent. ODF paragraphs mix bare text and elements constantly
+/// (`"before "<text:span>bold</text:span>" after"`), and a parent-level `text` string that simply
+/// concatenates everything the parser hands it — regardless of when a child element started or
+/// ended — cannot preserve that interleaving. Ordering it as children does, at the cost of a few
+/// `"#text"` checks in `OdtReader.collectSpans`.
+private final class XMLNode {
+    let name: String
+    let attributes: [String: String]
+    var children: [XMLNode] = []
+    /// Only meaningful on a `"#text"` node — the character data itself.
+    var text: String = ""
+
+    init(name: String, attributes: [String: String]) {
+        self.name = name
+        self.attributes = attributes
+    }
+
+    /// First direct child with this name, or nil.
+    func child(_ name: String) -> XMLNode? {
+        children.first { $0.name == name }
+    }
+
+    /// First match anywhere below this node, depth-first in document order.
+    func firstDescendant(_ name: String) -> XMLNode? {
+        for child in children {
+            if child.name == name { return child }
+            if let found = child.firstDescendant(name) { return found }
+        }
+        return nil
+    }
+
+    /// EVERY match anywhere below this node, in document order — used where a style table must
+    /// find every `text:list-style`/`style:style` regardless of which wrapper element holds it.
+    func allDescendants(_ name: String) -> [XMLNode] {
+        var result: [XMLNode] = []
+        for child in children {
+            if child.name == name { result.append(child) }
+            result.append(contentsOf: child.allDescendants(name))
+        }
+        return result
+    }
+}
+
+private final class XMLTreeBuilder: NSObject, XMLParserDelegate {
+    var root: XMLNode?
+    private var stack: [XMLNode] = []
+
+    func parser(
+        _ parser: XMLParser, didStartElement elementName: String, namespaceURI: String?,
+        qualifiedName qName: String?, attributes attributeDict: [String: String]
+    ) {
+        let node = XMLNode(name: elementName, attributes: attributeDict)
+        if let parent = stack.last {
+            parent.children.append(node)
+        } else {
+            root = node
+        }
+        stack.append(node)
+    }
+
+    /// Character data is appended into the CURRENT top-of-stack element as a `"#text"` pseudo-child
+    /// — merged into the last child if it is already one (the parser can call this more than once
+    /// for a single run of text), so mixed content keeps its real order without producing a run of
+    /// adjacent one-character `"#text"` nodes.
+    func parser(_ parser: XMLParser, foundCharacters string: String) {
+        guard let parent = stack.last else { return }
+        if let last = parent.children.last, last.name == "#text" {
+            last.text += string
+        } else {
+            let textNode = XMLNode(name: "#text", attributes: [:])
+            textNode.text = string
+            parent.children.append(textNode)
+        }
+    }
+
+    func parser(
+        _ parser: XMLParser, didEndElement elementName: String, namespaceURI: String?, qualifiedName qName: String?
+    ) {
+        stack.removeLast()
+    }
+}
