@@ -439,6 +439,150 @@ final class OdtReaderTests: XCTestCase {
         XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "no href")])])
     }
 
+    // MARK: Footnotes / endnotes
+    //
+    // NOTE ON EVIDENCE: like `DocxReaderTests`' footnote section, this is entirely synthetic — no
+    // fixture `.odt` in this project's corpus carries a real `text:note`. Built from the ODF spec
+    // shape (`text:note` containing `text:note-citation` + `text:note-body`), not measured.
+
+    func testFootnoteProducesSuperscriptMarkerAtCitationAndAppendsBodyAtDocumentEnd() throws {
+        let blocks = try read(body: """
+        <text:p>See <text:note text:id="ftn1" text:note-class="footnote">
+          <text:note-citation>1</text:note-citation>
+          <text:note-body><text:p>Note body text.</text:p></text:note-body>
+        </text:note> note.</text:p>
+        """)
+        XCTAssertEqual(blocks, [
+            .paragraph(spans: [Span(text: "See "), Span(text: "1", superscript: true), Span(text: " note.")]),
+            // The tab between marker and text is SYNTHETIC (`OdtReader.noteMarkerSeparator`) — ODF
+            // has nothing corresponding to docx's literal `w:tab` inside the note body, but the
+            // marker here is our own construct, so we own the separator and match what docx already
+            // shows for the same document (see the sprint's cross-format-divergence fix).
+            .paragraph(spans: [Span(text: "1", superscript: true), Span(text: "\t"), Span(text: "Note body text.")]),
+        ])
+    }
+
+    /// ODF tells footnotes and endnotes apart only by `text:note-class` — both are the SAME element
+    /// otherwise, and this reader renders them identically (the marker is the file's own
+    /// `text:note-citation` text either way, never recomputed), so an endnote needs no separate case.
+    func testEndnoteIsRenderedTheSameWayAsAFootnote() throws {
+        let blocks = try read(body: """
+        <text:p>See <text:note text:id="edn1" text:note-class="endnote">
+          <text:note-citation>i</text:note-citation>
+          <text:note-body><text:p>Endnote body.</text:p></text:note-body>
+        </text:note> note.</text:p>
+        """)
+        XCTAssertEqual(blocks, [
+            .paragraph(spans: [Span(text: "See "), Span(text: "i", superscript: true), Span(text: " note.")]),
+            .paragraph(spans: [Span(text: "i", superscript: true), Span(text: "\t"), Span(text: "Endnote body.")]),
+        ])
+    }
+
+    /// The corruption this sprint exists to avoid: a naive reader that walks `text:note` like any
+    /// other wrapper would splice "Note body text." into the middle of "See  note.", reading as one
+    /// garbled sentence. The citation and the body must stay visually separated.
+    func testFootnoteBodyIsNeverSplicedIntoTheCitingParagraphsOwnSpans() throws {
+        let blocks = try read(body: """
+        <text:p>See <text:note text:id="ftn1" text:note-class="footnote">
+          <text:note-citation>1</text:note-citation>
+          <text:note-body><text:p>Note body text.</text:p></text:note-body>
+        </text:note> note.</text:p>
+        """)
+        guard case .paragraph(let citingSpans) = blocks[0] else { return XCTFail("expected a paragraph") }
+        XCTAssertFalse(citingSpans.contains { $0.text.contains("Note body text.") })
+    }
+
+    /// Pins the exact separator between marker and body text against DRIFT: docx's note body reads
+    /// as `"1\tThe first note body text."` (a real `w:tab` FROM THE FILE, in Word's own footnote
+    /// template — see `DocxReaderTests`), and this reader must match that shape even though ODF has
+    /// no equivalent element to read it from. Reading `docs/fixtures/office/notes.docx` and
+    /// `docs/fixtures/office/notes.odt` (the real, LibreOffice-produced pair) must therefore produce
+    /// identical block text end to end — this test pins the mechanism that makes that hold, in a
+    /// fixture nobody has to keep around on disk to prove it.
+    func testMarkerAndBodyAreSeparatedByATabMatchingDocxsOwnFootnoteConvention() throws {
+        let blocks = try read(body: """
+        <text:p>See <text:note text:id="ftn1" text:note-class="footnote">
+          <text:note-citation>1</text:note-citation>
+          <text:note-body><text:p>The first note body text.</text:p></text:note-body>
+        </text:note> note.</text:p>
+        """)
+        guard case .paragraph(let noteSpans) = blocks[1] else { return XCTFail("expected the appended note paragraph") }
+        XCTAssertEqual(noteSpans.map(\.text).joined(), "1\tThe first note body text.")
+    }
+
+    /// A note missing `text:note-citation` entirely (malformed — ODF requires one) falls back to a
+    /// plain sequential counter in citation order, rather than a blank marker — mirroring what
+    /// `DocxReader` does for EVERY docx note (which never carries a citation number of its own at
+    /// all, see the correction in the sprint brief).
+    func testNoteWithNoCitationElementFallsBackToASequentialCounter() throws {
+        let blocks = try read(body: """
+        <text:p>See <text:note text:id="ftn1" text:note-class="footnote">
+          <text:note-body><text:p>Note body text.</text:p></text:note-body>
+        </text:note> note.</text:p>
+        """)
+        XCTAssertEqual(blocks, [
+            .paragraph(spans: [Span(text: "See "), Span(text: "1", superscript: true), Span(text: " note.")]),
+            .paragraph(spans: [Span(text: "1", superscript: true), Span(text: "\t"), Span(text: "Note body text.")]),
+        ])
+    }
+
+    /// A note missing `text:note-body` entirely (malformed) still shows its citation marker inline —
+    /// honest, since something WAS cited — but fabricates no body text, since there is none.
+    func testNoteWithNoBodyElementStillShowsMarkerButAppendsNothing() throws {
+        let blocks = try read(body: """
+        <text:p>See <text:note text:id="ftn1" text:note-class="footnote">
+          <text:note-citation>1</text:note-citation>
+        </text:note> note.</text:p>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "See "), Span(text: "1", superscript: true), Span(text: " note.")])])
+    }
+
+    /// Two footnotes cited in the same paragraph both get their own marker AND their own appended
+    /// body, in citation order — `text:note-citation`'s own text is trusted directly (never
+    /// recomputed), so this is really just proving two notes don't collide or reorder.
+    func testTwoFootnotesInOneParagraphEachGetTheirOwnMarkerAndBody() throws {
+        let blocks = try read(body: """
+        <text:p>One<text:note text:id="ftn1" text:note-class="footnote">
+          <text:note-citation>1</text:note-citation>
+          <text:note-body><text:p>First note.</text:p></text:note-body>
+        </text:note> two<text:note text:id="ftn2" text:note-class="footnote">
+          <text:note-citation>2</text:note-citation>
+          <text:note-body><text:p>Second note.</text:p></text:note-body>
+        </text:note></text:p>
+        """)
+        XCTAssertEqual(blocks, [
+            .paragraph(spans: [
+                Span(text: "One"), Span(text: "1", superscript: true), Span(text: " two"), Span(text: "2", superscript: true),
+            ]),
+            .paragraph(spans: [Span(text: "1", superscript: true), Span(text: "\t"), Span(text: "First note.")]),
+            .paragraph(spans: [Span(text: "2", superscript: true), Span(text: "\t"), Span(text: "Second note.")]),
+        ])
+    }
+
+    /// An image inside a footnote's body belongs to the FOOTNOTE, not to the paragraph that cites
+    /// it — `collectImages`' blind `allDescendants` walk over the citing paragraph would otherwise
+    /// find it too and duplicate it at the wrong place (see `OdtReader.collectImages`).
+    func testImageInsideAFootnoteBodyDoesNotLeakIntoTheCitingParagraphsOwnImages() throws {
+        let blocks = try readWithMedia(
+            body: """
+            <text:p>See <text:note text:id="ftn1" text:note-class="footnote">
+              <text:note-citation>1</text:note-citation>
+              <text:note-body>
+                <text:p><draw:frame svg:width="1in" svg:height="1in"><draw:image xlink:href="Pictures/note.png"/></draw:frame></text:p>
+              </text:note-body>
+            </text:note> note.</text:p>
+            """,
+            media: [("Pictures/note.png", [0x00])])
+        XCTAssertEqual(blocks, [
+            .paragraph(spans: [Span(text: "See "), Span(text: "1", superscript: true), Span(text: " note.")]),
+            // The note body opens with an image, not text — nowhere to splice the marker span into
+            // (`OdtReader.prependingMarker` returns `nil` for `.image`), so it becomes its own small
+            // leading paragraph rather than being silently dropped.
+            .paragraph(spans: [Span(text: "1", superscript: true)]),
+            .image(id: "Pictures/note.png", size: CGSize(width: 72, height: 72)),
+        ])
+    }
+
     // MARK: Archive-level failure and absent optional parts
 
     func testArchiveWithNoContentXMLThrows() throws {

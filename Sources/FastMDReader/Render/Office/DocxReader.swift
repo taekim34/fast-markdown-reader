@@ -40,7 +40,143 @@ enum DocxReader {
         let numbering = parseNumbering(from: archive)
         let relationships = parseRelationships(from: archive)
         guard let body = documentRoot.child("w:body") else { return [] }
-        return parseBody(body, styleOutlineLevels: styleOutlineLevels, numbering: numbering, relationships: relationships)
+        // Footnote/endnote numbering is resolved BEFORE the body is walked for real: Word doesn't
+        // stamp an explicit display number on `w:footnoteReference`/`w:endnoteReference` (unlike
+        // ODF's `text:note-citation`, which literally contains its own marker text) — the number is
+        // purely positional, so it has to come from a first pass over the whole body in document
+        // order, footnotes and endnotes counted separately (each is its own sequence in Word, both
+        // starting at 1). This is "auto-number", not "invented" — it's the same number Word itself
+        // would display.
+        let (footnoteNumberById, endnoteNumberById, citationOrder) = numberNoteReferences(in: body)
+        let notes = NoteNumbering(footnote: footnoteNumberById, endnote: endnoteNumberById)
+        let bodyBlocks = parseBody(
+            body, styleOutlineLevels: styleOutlineLevels, numbering: numbering, relationships: relationships, notes: notes)
+        let footnoteBodies = parseNoteBodies(from: archive, part: "word/footnotes.xml", noteElementName: "w:footnote")
+        let endnoteBodies = parseNoteBodies(from: archive, part: "word/endnotes.xml", noteElementName: "w:endnote")
+        let noteBlocks = collectNoteBlocks(
+            citationOrder: citationOrder, footnoteBodies: footnoteBodies, endnoteBodies: endnoteBodies,
+            styleOutlineLevels: styleOutlineLevels, numbering: numbering, relationships: relationships, notes: notes)
+        return bodyBlocks + noteBlocks
+    }
+
+    // MARK: Footnotes / endnotes
+
+    /// `word/footnotes.xml` (and the identically-shaped `word/endnotes.xml`) is a flat list of
+    /// `w:footnote`/`w:endnote` elements keyed by `w:id`, each holding ordinary `w:p` paragraphs —
+    /// the note's actual author-written text. Two ids are reserved and carry NO real content:
+    /// `w:type="separator"` and `w:type="continuationSeparator"` are the little horizontal rule
+    /// Word draws above notes on a page (and its continuation), present in essentially every real
+    /// `.docx` whether or not the document has a single real footnote. Filtering by `w:type` (not
+    /// by id, e.g. "ids ≤ 0 are boilerplate") is the only reliable signal — a document's real notes
+    /// happen to start at id 1 in practice, but nothing in the spec guarantees that, while the type
+    /// attribute is exactly what Word itself uses to tell them apart. A note with no `w:type` at all
+    /// is real content, never boilerplate.
+    private static func parseNoteBodies(from archive: ZipArchive, part: String, noteElementName: String) -> [String: XMLNode] {
+        guard archive.contains(part), let data = try? archive.data(for: part), let root = try? buildTree(data)
+        else { return [:] }
+        var map: [String: XMLNode] = [:]
+        for note in root.children where note.name == noteElementName {
+            guard let id = note.attributes["w:id"] else { continue }
+            let type = note.attributes["w:type"]
+            guard type != "separator", type != "continuationSeparator" else { continue }
+            map[id] = note
+        }
+        return map
+    }
+
+    private enum NoteKind { case footnote, endnote }
+
+    /// Number → the marker rendered at both the citation point and the note body it points to.
+    /// Separate maps because footnotes and endnotes are separate numbering sequences in Word (both
+    /// commonly start at 1) — collapsing them into one counter would make a document's second
+    /// footnote and its first endnote fight over "2".
+    private struct NoteNumbering {
+        var footnote: [String: Int] = [:]
+        var endnote: [String: Int] = [:]
+    }
+
+    /// One recursive walk of the ENTIRE body — not two separate searches — so the two kinds of
+    /// reference come back in one true document order regardless of how they're nested (inside a
+    /// table cell, a text box, a grouped drawing, an `w:sdt` wrapper …); interleaving them correctly
+    /// only matters for `citationOrder` (what gets appended at the end, and in what sequence), since
+    /// footnotes and endnotes are numbered independently of each other. A repeated reference to the
+    /// SAME id (unusual, but not forbidden) reuses the number already assigned instead of adding a
+    /// second entry to `citationOrder` — the note body is only appended once.
+    private static func numberNoteReferences(
+        in body: XMLNode
+    ) -> (footnote: [String: Int], endnote: [String: Int], citationOrder: [(kind: NoteKind, id: String, number: Int)]) {
+        var footnoteNumberById: [String: Int] = [:]
+        var endnoteNumberById: [String: Int] = [:]
+        var citationOrder: [(kind: NoteKind, id: String, number: Int)] = []
+        // Deliberately NOT a `switch`-with-`default: continue` — a footnote/endnote reference is
+        // nested INSIDE a run (`w:r`), which is nested inside a paragraph, which may itself be
+        // nested inside a table cell, a text box, an `w:sdt` wrapper, … `continue`-ing out of a
+        // switch's default case would skip recursing into every one of those non-matching wrappers,
+        // silently missing every reference not sitting at the top level. Every node is walked
+        // unconditionally; matching is a plain check alongside that walk, not a branch that gates it.
+        func walk(_ node: XMLNode) {
+            for child in node.children {
+                if child.name == "w:footnoteReference", let id = child.attributes["w:id"], footnoteNumberById[id] == nil {
+                    let number = footnoteNumberById.count + 1
+                    footnoteNumberById[id] = number
+                    citationOrder.append((.footnote, id, number))
+                } else if child.name == "w:endnoteReference", let id = child.attributes["w:id"], endnoteNumberById[id] == nil {
+                    let number = endnoteNumberById.count + 1
+                    endnoteNumberById[id] = number
+                    citationOrder.append((.endnote, id, number))
+                }
+                walk(child)
+            }
+        }
+        walk(body)
+        return (footnoteNumberById, endnoteNumberById, citationOrder)
+    }
+
+    /// Turns each cited note into ordinary blocks, appended in citation order at document's end —
+    /// never inlined at the reference point (see the sprint brief: Word keeps them visually
+    /// separated). Reuses `parseBodyChild` for the note's own paragraphs/tables, exactly the same
+    /// walk the document body itself gets, rather than a second flattener. A note whose id doesn't
+    /// resolve to any real part (a malformed/edited document) contributes nothing — its marker still
+    /// appears at the citation point, honestly showing "something was cited here", but there is no
+    /// text to fabricate for it.
+    private static func collectNoteBlocks(
+        citationOrder: [(kind: NoteKind, id: String, number: Int)], footnoteBodies: [String: XMLNode],
+        endnoteBodies: [String: XMLNode], styleOutlineLevels: [String: Int], numbering: NumberingInfo,
+        relationships: Relationships, notes: NoteNumbering
+    ) -> [OfficeBlock] {
+        citationOrder.flatMap { entry -> [OfficeBlock] in
+            let noteElement = entry.kind == .footnote ? footnoteBodies[entry.id] : endnoteBodies[entry.id]
+            guard let noteElement else { return [] }
+            var blocks = noteElement.children.flatMap {
+                parseBodyChild(
+                    $0, styleOutlineLevels: styleOutlineLevels, numbering: numbering, relationships: relationships,
+                    notes: notes)
+            }
+            // Never fabricated — this is the SAME marker text emitted at the citation point
+            // (`collectSpans`'s `w:footnoteReference`/`w:endnoteReference` case), so a reader can
+            // visually match a note back to where it was cited.
+            let marker = Span(text: "\(entry.number)", superscript: true)
+            if let first = blocks.first, let markedFirst = prependingMarker(marker, to: first) {
+                blocks[0] = markedFirst
+            } else {
+                // Empty note body, or one that opens with a table/image — neither has anywhere to
+                // splice a span into, so the marker becomes its own small leading paragraph instead
+                // of being silently dropped.
+                blocks.insert(.paragraph(spans: [marker]), at: 0)
+            }
+            return blocks
+        }
+    }
+
+    /// `nil` for `.table`/`.image` — there is no `[Span]` inside either to prepend into — so the
+    /// caller falls back to a standalone marker paragraph instead.
+    private static func prependingMarker(_ marker: Span, to block: OfficeBlock) -> OfficeBlock? {
+        switch block {
+        case .paragraph(let spans): return .paragraph(spans: [marker] + spans)
+        case .heading(let level, let spans): return .heading(level: level, spans: [marker] + spans)
+        case .listItem(let level, let ordered, let spans): return .listItem(level: level, ordered: ordered, spans: [marker] + spans)
+        case .table, .image: return nil
+        }
     }
 
     // MARK: styles.xml — styleId → outlineLvl
@@ -176,7 +312,8 @@ enum DocxReader {
     /// failed to load when there never was one. Such a shape contributes its TEXT instead, if it
     /// has any (`w:txbxContent`), and nothing at all if it has neither picture nor text.
     private static func collectDrawingBlocks(
-        in node: XMLNode, styleOutlineLevels: [String: Int], numbering: NumberingInfo, relationships: Relationships
+        in node: XMLNode, styleOutlineLevels: [String: Int], numbering: NumberingInfo, relationships: Relationships,
+        notes: NoteNumbering
     ) -> [OfficeBlock] {
         var blocks: [OfficeBlock] = []
         func walk(_ node: XMLNode) {
@@ -193,7 +330,7 @@ enum DocxReader {
                     } else {
                         blocks.append(contentsOf: textBoxBlocks(
                             in: child, styleOutlineLevels: styleOutlineLevels, numbering: numbering,
-                            relationships: relationships))
+                            relationships: relationships, notes: notes))
                     }
                 case "w:pict":
                     if let block = imageBlock(fromPict: child, relationships: relationships) {
@@ -201,7 +338,7 @@ enum DocxReader {
                     } else {
                         blocks.append(contentsOf: textBoxBlocks(
                             in: child, styleOutlineLevels: styleOutlineLevels, numbering: numbering,
-                            relationships: relationships))
+                            relationships: relationships, notes: notes))
                     }
                 default:
                     walk(child)
@@ -221,13 +358,15 @@ enum DocxReader {
     /// no text, and must produce no block; the body's own "empty paragraph = a blank line" reading
     /// does not apply to shape decoration.
     private static func textBoxBlocks(
-        in node: XMLNode, styleOutlineLevels: [String: Int], numbering: NumberingInfo, relationships: Relationships
+        in node: XMLNode, styleOutlineLevels: [String: Int], numbering: NumberingInfo, relationships: Relationships,
+        notes: NoteNumbering
     ) -> [OfficeBlock] {
         var blocks: [OfficeBlock] = []
         for txbx in node.allDescendants("w:txbxContent") {
             for p in txbx.children where p.name == "w:p" {
                 let paragraphBlocks = parseParagraph(
-                    p, styleOutlineLevels: styleOutlineLevels, numbering: numbering, relationships: relationships)
+                    p, styleOutlineLevels: styleOutlineLevels, numbering: numbering, relationships: relationships,
+                    notes: notes)
                 blocks.append(contentsOf: paragraphBlocks.filter { !isEmptyTextBlock($0) })
             }
         }
@@ -427,10 +566,12 @@ enum DocxReader {
     // MARK: word/document.xml — body → blocks
 
     private static func parseBody(
-        _ body: XMLNode, styleOutlineLevels: [String: Int], numbering: NumberingInfo, relationships: Relationships
+        _ body: XMLNode, styleOutlineLevels: [String: Int], numbering: NumberingInfo, relationships: Relationships,
+        notes: NoteNumbering
     ) -> [OfficeBlock] {
         body.children.flatMap {
-            parseBodyChild($0, styleOutlineLevels: styleOutlineLevels, numbering: numbering, relationships: relationships)
+            parseBodyChild(
+                $0, styleOutlineLevels: styleOutlineLevels, numbering: numbering, relationships: relationships, notes: notes)
         }
     }
 
@@ -443,18 +584,22 @@ enum DocxReader {
     /// a lock setting, …) is deliberately never read — the only thing needed from `w:sdt` is its
     /// content. Anything else at this level (the body's own trailing `w:sectPr`) is not a block.
     private static func parseBodyChild(
-        _ child: XMLNode, styleOutlineLevels: [String: Int], numbering: NumberingInfo, relationships: Relationships
+        _ child: XMLNode, styleOutlineLevels: [String: Int], numbering: NumberingInfo, relationships: Relationships,
+        notes: NoteNumbering
     ) -> [OfficeBlock] {
         switch child.name {
         case "w:p":
             return parseParagraph(
-                child, styleOutlineLevels: styleOutlineLevels, numbering: numbering, relationships: relationships)
+                child, styleOutlineLevels: styleOutlineLevels, numbering: numbering, relationships: relationships,
+                notes: notes)
         case "w:tbl":
-            return [parseTable(child, relationships: relationships)]
+            return [parseTable(child, relationships: relationships, notes: notes)]
         case "w:sdt":
             guard let content = child.child("w:sdtContent") else { return [] }
             return content.children.flatMap {
-                parseBodyChild($0, styleOutlineLevels: styleOutlineLevels, numbering: numbering, relationships: relationships)
+                parseBodyChild(
+                    $0, styleOutlineLevels: styleOutlineLevels, numbering: numbering, relationships: relationships,
+                    notes: notes)
             }
         default:
             return []
@@ -468,12 +613,14 @@ enum DocxReader {
     /// its own) contributes no empty text block, so callers never see a phantom `.paragraph(spans: [])`
     /// standing in for a picture.
     private static func parseParagraph(
-        _ p: XMLNode, styleOutlineLevels: [String: Int], numbering: NumberingInfo, relationships: Relationships
+        _ p: XMLNode, styleOutlineLevels: [String: Int], numbering: NumberingInfo, relationships: Relationships,
+        notes: NoteNumbering
     ) -> [OfficeBlock] {
         let pPr = p.child("w:pPr")
-        let spans = collectSpans(in: p, relationships: relationships)
+        let spans = collectSpans(in: p, relationships: relationships, notes: notes)
         let drawingBlocks = collectDrawingBlocks(
-            in: p, styleOutlineLevels: styleOutlineLevels, numbering: numbering, relationships: relationships)
+            in: p, styleOutlineLevels: styleOutlineLevels, numbering: numbering, relationships: relationships,
+            notes: notes)
         // Heading wins over list, even when the paragraph ALSO carries `w:numPr` — Word-authored
         // contracts routinely attach a multilevel list to their heading styles so "1. Definitions"
         // / "2.1 Interpretation" number themselves, and `outlineLvl` is the author's explicit
@@ -510,7 +657,7 @@ enum DocxReader {
     /// cell still carries its own `<w:tc>` occupying its column, per spec), so this cumulative walk
     /// lands on the correct column even when two rows have a different NUMBER of `<w:tc>` (a
     /// horizontal merge changes how many `<w:tc>` a row needs without changing the grid it spans).
-    private static func parseTable(_ tbl: XMLNode, relationships: Relationships) -> OfficeBlock {
+    private static func parseTable(_ tbl: XMLNode, relationships: Relationships, notes: NoteNumbering) -> OfficeBlock {
         let rowNodes = tbl.children.filter { $0.name == "w:tr" }
         var rows: [[Cell]] = []
         // Grid column → where in `rows` its currently-open vertical-merge anchor lives, so a
@@ -542,7 +689,7 @@ enum DocxReader {
                     // to extend, and a `continue` cell is never content of its own, so it is simply
                     // dropped rather than fabricated into a normal cell.
                 } else {
-                    let spans = collectCellSpans(tc, relationships: relationships)
+                    let spans = collectCellSpans(tc, relationships: relationships, notes: notes)
                     rowCells.append(Cell(spans: spans, rowSpan: 1, colSpan: colSpan))
                     if vMerge != nil {
                         // `val="restart"` — the top of a genuine new vertical-merge chain; later
@@ -590,17 +737,17 @@ enum DocxReader {
     /// Deliberately mirrors `OdtReader.collectCellSpans`/`flattenNestedTable` exactly (same
     /// separator convention: a tab between cells, a newline after each non-empty row), so the two
     /// formats produce comparable output for the same shape rather than silently disagreeing.
-    private static func collectCellSpans(_ tc: XMLNode, relationships: Relationships) -> [Span] {
+    private static func collectCellSpans(_ tc: XMLNode, relationships: Relationships, notes: NoteNumbering) -> [Span] {
         var spans: [Span] = []
         for child in tc.children {
             switch child.name {
             case "w:p":
-                spans.append(contentsOf: collectSpans(in: child, relationships: relationships))
+                spans.append(contentsOf: collectSpans(in: child, relationships: relationships, notes: notes))
             case "w:tbl":
-                spans.append(contentsOf: flattenNestedTable(child, relationships: relationships))
+                spans.append(contentsOf: flattenNestedTable(child, relationships: relationships, notes: notes))
             case "w:sdt":
                 if let content = child.child("w:sdtContent") {
-                    spans.append(contentsOf: collectCellSpans(content, relationships: relationships))
+                    spans.append(contentsOf: collectCellSpans(content, relationships: relationships, notes: notes))
                 }
             default:
                 continue
@@ -615,12 +762,12 @@ enum DocxReader {
     /// `collectCellSpans`, so a table nested inside a nested table (and a content control inside
     /// THAT) also survives — no depth cap is enforced; real documents don't go more than one or
     /// two levels, per the research survey.
-    private static func flattenNestedTable(_ table: XMLNode, relationships: Relationships) -> [Span] {
+    private static func flattenNestedTable(_ table: XMLNode, relationships: Relationships, notes: NoteNumbering) -> [Span] {
         var spans: [Span] = []
         for row in table.children where row.name == "w:tr" {
             var rowHasContent = false
             for cell in row.children where cell.name == "w:tc" {
-                let cellSpans = collectCellSpans(cell, relationships: relationships)
+                let cellSpans = collectCellSpans(cell, relationships: relationships, notes: notes)
                 guard !cellSpans.isEmpty else { continue }
                 if rowHasContent { spans.append(Span(text: "\t")) }
                 spans.append(contentsOf: cellSpans)
@@ -648,7 +795,7 @@ enum DocxReader {
     /// mistaken for one. Only elements known to carry NO renderable body text of their own are
     /// pruned: paragraph/run properties (formatting only), deleted-content wrappers, empty
     /// markers, and section properties.
-    private static func collectSpans(in node: XMLNode, relationships: Relationships) -> [Span] {
+    private static func collectSpans(in node: XMLNode, relationships: Relationships, notes: NoteNumbering) -> [Span] {
         var spans: [Span] = []
         func appendMerging(_ span: Span) {
             if let last = spans.last, last.bold == span.bold, last.italic == span.italic,
@@ -675,6 +822,32 @@ enum DocxReader {
                 case "w:sdt":
                     if let content = child.child("w:sdtContent") { walk(content, link: link) }
                 case "w:r":
+                    // A footnote/endnote reference is a MARKER element nested inside the run
+                    // (`<w:r><w:rPr>…</w:rPr><w:footnoteReference w:id="1"/></w:r>`), not text —
+                    // `buildSpan` below has no `w:t` to read from such a run and would otherwise
+                    // silently produce nothing, dropping the citation entirely. Emitted as its OWN
+                    // superscript span carrying the pre-computed marker number (`notes`, resolved
+                    // once for the whole document in `numberNoteReferences` before this walk ever
+                    // ran) — the SAME number the corresponding note body is prefixed with in
+                    // `collectNoteBlocks`, so a reader can match one to the other. An id that
+                    // resolves to no number (present in `w:footnoteReference` but this document's
+                    // body was never walked for numbering — can't happen from `read()`, but this
+                    // guards a caller that reuses `collectSpans` some other way) contributes nothing
+                    // rather than a bare, meaningless digit.
+                    for refChild in child.children {
+                        switch refChild.name {
+                        case "w:footnoteReference":
+                            if let id = refChild.attributes["w:id"], let number = notes.footnote[id] {
+                                appendMerging(Span(text: "\(number)", link: link, superscript: true))
+                            }
+                        case "w:endnoteReference":
+                            if let id = refChild.attributes["w:id"], let number = notes.endnote[id] {
+                                appendMerging(Span(text: "\(number)", link: link, superscript: true))
+                            }
+                        default:
+                            continue
+                        }
+                    }
                     if var span = buildSpan(from: child) {
                         span.link = link
                         appendMerging(span)

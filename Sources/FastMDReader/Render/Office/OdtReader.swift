@@ -51,7 +51,97 @@ enum OdtReader {
             textStyles.merge(parseTextStyles(from: root)) { existing, _ in existing }
         }
         guard let body = contentRoot.firstDescendant("office:text") else { return [] }
-        return parseBody(body, listStyles: listStyles, textStyles: textStyles, archive: archive)
+        // ODF footnotes AND endnotes are the SAME element (`text:note`, told apart only by
+        // `text:note-class`), sitting INLINE at the citation point with the note's own marker
+        // (`text:note-citation`) and full body (`text:note-body`) as children of that one element —
+        // unlike docx, which keeps the body in a wholly separate part. `NoteCollector` is filled in
+        // by `collectSpans`'s `text:note` case DURING the one real body walk (not a separate
+        // up-front pass): when that walk meets a `text:note`, it emits the marker inline and records
+        // `(marker, body)` on the collector rather than recursing into the body — that recursion
+        // skip is the detachment that keeps the note's text from being spliced into the citing
+        // sentence. Once the body walk finishes, the collector holds every note in citation order,
+        // ready to be rendered — once, here, at the document's end.
+        let notes = NoteCollector()
+        let bodyBlocks = parseBody(body, listStyles: listStyles, textStyles: textStyles, archive: archive, notes: notes)
+        let noteBlocks = buildNoteBlocks(notes.entries, listStyles: listStyles, textStyles: textStyles, archive: archive)
+        return bodyBlocks + noteBlocks
+    }
+
+    // MARK: Footnotes / endnotes — text:note (told apart by text:note-class, but rendered identically)
+
+    /// Accumulates `(marker, body)` for every `text:note` the real body walk encounters, in citation
+    /// order, plus the running counter `collectSpans` falls back to when a note has no
+    /// `text:note-citation` of its own (malformed — ODF requires one, but this reader never crashes
+    /// on a broken document). A class, not a struct, because `collectSpans` and its callers thread
+    /// it through several layers (paragraphs, list items, table cells) purely to mutate one shared
+    /// list — value semantics would silently fork it at every call boundary.
+    private final class NoteCollector {
+        var fallbackCounter = 1
+        var entries: [(marker: String, body: XMLNode)] = []
+    }
+
+    /// `text:note-citation`'s own character-data children ARE the marker Word/LibreOffice actually
+    /// displays ("1", "i", …, whatever the note's numbering style produced) — read verbatim, never
+    /// recomputed, so this reader never has to know footnote vs. endnote numbering schemes (unlike
+    /// docx's `w:footnoteReference`, which carries no number of its own — see `DocxReader`). Missing
+    /// entirely (malformed) yields an empty string, which the caller (`collectSpans`'s `text:note`
+    /// case) falls back to `NoteCollector.fallbackCounter` for, rather than showing a blank marker.
+    private static func noteCitationText(_ note: XMLNode) -> String {
+        guard let citation = note.child("text:note-citation") else { return "" }
+        return citation.children.filter { $0.name == "#text" }.map(\.text).joined()
+    }
+
+    /// Turns each note's body into ordinary blocks — reusing `parseBody` itself, since
+    /// `text:note-body`'s children (`text:p`/`text:h`/`text:list`/`table:table`) are exactly the
+    /// shape `office:text`'s own children are — appended in citation order at the document's end,
+    /// each prefixed with the SAME marker span rendered at the citation point, so a reader can match
+    /// one back to the other. See `DocxReader.collectNoteBlocks`/`prependingMarker` for the mirrored
+    /// docx-side logic (kept format-specific rather than shared, per the roadmap's own call: the
+    /// EXTRACTION differs per format, only the output shape is one-to-one).
+    private static func buildNoteBlocks(
+        _ noteEntries: [(marker: String, body: XMLNode)], listStyles: [String: [Int: Bool]],
+        textStyles: [String: TextStyle], archive: ZipArchive
+    ) -> [OfficeBlock] {
+        noteEntries.flatMap { entry -> [OfficeBlock] in
+            // A footnote/endnote body cannot itself contain another `text:note` in any real
+            // document (ODF disallows it), so a note-body-local `NoteCollector` here only ever
+            // guards against a malformed file recursing forever — it is discarded, never merged
+            // back into the outer one.
+            var blocks = parseBody(entry.body, listStyles: listStyles, textStyles: textStyles, archive: archive, notes: NoteCollector())
+            let marker = Span(text: entry.marker, superscript: true)
+            if let first = blocks.first, let markedFirst = prependingMarker(marker, to: first) {
+                blocks[0] = markedFirst
+            } else {
+                // Empty note body, or one that opens with a table/image — neither has a `[Span]` to
+                // splice into, so the marker becomes its own small leading paragraph instead of
+                // being silently dropped.
+                blocks.insert(.paragraph(spans: [marker]), at: 0)
+            }
+            return blocks
+        }
+    }
+
+    /// Word stores a literal `w:tab` inside the note body itself, between the auto-numbered mark
+    /// and the text (its own footnote-paragraph template fakes a hanging indent that way) — so a
+    /// docx note body's OWN first span already starts with `"\t"`, read verbatim like any other
+    /// tab in the document. ODF has no such element (its hanging indent is a paragraph-style
+    /// property, not a character), and since the marker prepended here is OUR OWN construct, not
+    /// something the file gave us, the number would otherwise run straight into the first word —
+    /// `"1The first note body text."` reads as a typo, and a reader comparing the two formats'
+    /// output would see them disagree over one document for no reason a user could point to. A
+    /// synthetic tab span, plain (not superscript, not part of the marker itself), closes that gap
+    /// and matches what docx already shows.
+    private static let noteMarkerSeparator = Span(text: "\t")
+
+    /// `nil` for `.table`/`.image` — there is no `[Span]` inside either to prepend into.
+    private static func prependingMarker(_ marker: Span, to block: OfficeBlock) -> OfficeBlock? {
+        switch block {
+        case .paragraph(let spans): return .paragraph(spans: [marker, noteMarkerSeparator] + spans)
+        case .heading(let level, let spans): return .heading(level: level, spans: [marker, noteMarkerSeparator] + spans)
+        case .listItem(let level, let ordered, let spans):
+            return .listItem(level: level, ordered: ordered, spans: [marker, noteMarkerSeparator] + spans)
+        case .table, .image: return nil
+        }
     }
 
     // MARK: Text (span) styles — automatic-styles → bold/italic/underline
@@ -129,7 +219,8 @@ enum OdtReader {
     // MARK: content.xml — office:text → blocks
 
     private static func parseBody(
-        _ text: XMLNode, listStyles: [String: [Int: Bool]], textStyles: [String: TextStyle], archive: ZipArchive
+        _ text: XMLNode, listStyles: [String: [Int: Bool]], textStyles: [String: TextStyle], archive: ZipArchive,
+        notes: NoteCollector
     ) -> [OfficeBlock] {
         var blocks: [OfficeBlock] = []
         for child in text.children {
@@ -138,15 +229,17 @@ enum OdtReader {
                 let rawLevel = Int(child.attributes["text:outline-level"] ?? "") ?? 1
                 let level = min(max(rawLevel, 1), 6)
                 blocks.append(contentsOf: paragraphLikeBlocks(
-                    child, make: { .heading(level: level, spans: $0) }, textStyles: textStyles, archive: archive))
+                    child, make: { .heading(level: level, spans: $0) }, textStyles: textStyles, archive: archive,
+                    notes: notes))
             case "text:p":
                 blocks.append(contentsOf: paragraphLikeBlocks(
-                    child, make: { .paragraph(spans: $0) }, textStyles: textStyles, archive: archive))
+                    child, make: { .paragraph(spans: $0) }, textStyles: textStyles, archive: archive, notes: notes))
             case "text:list":
                 blocks.append(contentsOf: parseList(
-                    child, level: 0, inheritedStyleName: nil, listStyles: listStyles, textStyles: textStyles, archive: archive))
+                    child, level: 0, inheritedStyleName: nil, listStyles: listStyles, textStyles: textStyles,
+                    archive: archive, notes: notes))
             case "table:table":
-                blocks.append(parseTable(child, textStyles: textStyles))
+                blocks.append(parseTable(child, textStyles: textStyles, notes: notes))
             default:
                 // e.g. `text:sequence-decls`, `office:scripts` reached via a broader search — not
                 // a block. `office:text`'s own children never include those, but this stays
@@ -164,9 +257,10 @@ enum OdtReader {
     /// no empty text block, so callers never see a phantom `.paragraph(spans: [])` standing in for
     /// a picture.
     private static func paragraphLikeBlocks(
-        _ node: XMLNode, make: ([Span]) -> OfficeBlock, textStyles: [String: TextStyle], archive: ZipArchive
+        _ node: XMLNode, make: ([Span]) -> OfficeBlock, textStyles: [String: TextStyle], archive: ZipArchive,
+        notes: NoteCollector
     ) -> [OfficeBlock] {
-        let spans = collectSpans(in: node, style: TextStyle(), textStyles: textStyles)
+        let spans = collectSpans(in: node, style: TextStyle(), textStyles: textStyles, notes: notes)
         let images = collectImages(in: node, archive: archive)
         var blocks: [OfficeBlock] = []
         if !(spans.isEmpty && !images.isEmpty) { blocks.append(make(spans)) }
@@ -184,7 +278,7 @@ enum OdtReader {
     /// because the inner element omitted a redundant attribute.
     private static func parseList(
         _ list: XMLNode, level: Int, inheritedStyleName: String?, listStyles: [String: [Int: Bool]],
-        textStyles: [String: TextStyle], archive: ZipArchive
+        textStyles: [String: TextStyle], archive: ZipArchive, notes: NoteCollector
     ) -> [OfficeBlock] {
         let styleName = list.attributes["text:style-name"] ?? inheritedStyleName
         let ordered = isOrdered(styleName: styleName, level: level, listStyles: listStyles)
@@ -195,11 +289,11 @@ enum OdtReader {
                 case "text:p":
                     blocks.append(contentsOf: paragraphLikeBlocks(
                         child, make: { .listItem(level: level, ordered: ordered, spans: $0) },
-                        textStyles: textStyles, archive: archive))
+                        textStyles: textStyles, archive: archive, notes: notes))
                 case "text:list":
                     blocks.append(contentsOf: parseList(
                         child, level: level + 1, inheritedStyleName: styleName, listStyles: listStyles,
-                        textStyles: textStyles, archive: archive))
+                        textStyles: textStyles, archive: archive, notes: notes))
                 default:
                     continue
                 }
@@ -214,18 +308,18 @@ enum OdtReader {
     /// per-row flag the way docx's `w:tblHeader` is — its absence (this fixture has none) means
     /// `headerRows == 0`, never a guess of 1 (`OfficeBlock.table`'s own contract: an un-styled
     /// table is a faithful rendering, a wrongly-bolded row is not).
-    private static func parseTable(_ table: XMLNode, textStyles: [String: TextStyle]) -> OfficeBlock {
+    private static func parseTable(_ table: XMLNode, textStyles: [String: TextStyle], notes: NoteCollector) -> OfficeBlock {
         var rows: [[Cell]] = []
         var headerRows = 0
         for child in table.children {
             switch child.name {
             case "table:table-header-rows":
                 let expanded = child.children.filter { $0.name == "table:table-row" }
-                    .flatMap { expandRow($0, textStyles: textStyles) }
+                    .flatMap { expandRow($0, textStyles: textStyles, notes: notes) }
                 headerRows += expanded.count
                 rows.append(contentsOf: expanded)
             case "table:table-row":
-                rows.append(contentsOf: expandRow(child, textStyles: textStyles))
+                rows.append(contentsOf: expandRow(child, textStyles: textStyles, notes: notes))
             default:
                 continue
             }
@@ -245,11 +339,11 @@ enum OdtReader {
     /// no cross-row bookkeeping to do, each row already states its own covered positions. Dropping
     /// those placeholders (contributing zero `Cell`s) is therefore correct on its own: what's left
     /// is exactly `OfficeBlock.table`'s anchor-only shape, spans/repeats notwithstanding.
-    private static func expandRow(_ row: XMLNode, textStyles: [String: TextStyle]) -> [[Cell]] {
+    private static func expandRow(_ row: XMLNode, textStyles: [String: TextStyle], notes: NoteCollector) -> [[Cell]] {
         let rowRepeat = Int(row.attributes["table:number-rows-repeated"] ?? "") ?? 1
         var cells: [Cell] = []
         for cell in row.children where cell.name == "table:table-cell" {
-            let spans = collectCellSpans(cell, textStyles: textStyles)
+            let spans = collectCellSpans(cell, textStyles: textStyles, notes: notes)
             let rowSpan = Int(cell.attributes["table:number-rows-spanned"] ?? "") ?? 1
             let colSpan = Int(cell.attributes["table:number-columns-spanned"] ?? "") ?? 1
             let colRepeat = Int(cell.attributes["table:number-columns-repeated"] ?? "") ?? 1
@@ -266,14 +360,14 @@ enum OdtReader {
     /// to spans. `Cell` has no case for a nested `.table` block (research-odt.md §4 sanctions this
     /// as a legitimate depth-1 shortcut for a flat block viewer: the grid disappears, but no text
     /// does — "skip presentation fidelity freely, never content").
-    private static func collectCellSpans(_ cell: XMLNode, textStyles: [String: TextStyle]) -> [Span] {
+    private static func collectCellSpans(_ cell: XMLNode, textStyles: [String: TextStyle], notes: NoteCollector) -> [Span] {
         var spans: [Span] = []
         for child in cell.children {
             switch child.name {
             case "text:p", "text:h":
-                spans.append(contentsOf: collectSpans(in: child, style: TextStyle(), textStyles: textStyles))
+                spans.append(contentsOf: collectSpans(in: child, style: TextStyle(), textStyles: textStyles, notes: notes))
             case "table:table":
-                spans.append(contentsOf: flattenNestedTable(child, textStyles: textStyles))
+                spans.append(contentsOf: flattenNestedTable(child, textStyles: textStyles, notes: notes))
             default:
                 continue
             }
@@ -286,7 +380,7 @@ enum OdtReader {
     /// ended and the next began, even though the grid itself is gone. Recurses through
     /// `collectCellSpans`, so a table nested inside a nested table also survives (no depth cap is
     /// enforced; real documents don't go more than one or two levels, per the research survey).
-    private static func flattenNestedTable(_ table: XMLNode, textStyles: [String: TextStyle]) -> [Span] {
+    private static func flattenNestedTable(_ table: XMLNode, textStyles: [String: TextStyle], notes: NoteCollector) -> [Span] {
         let rows = table.children.flatMap { node -> [XMLNode] in
             if node.name == "table:table-header-rows" { return node.children.filter { $0.name == "table:table-row" } }
             if node.name == "table:table-row" { return [node] }
@@ -296,7 +390,7 @@ enum OdtReader {
         for row in rows {
             var rowHasContent = false
             for cell in row.children where cell.name == "table:table-cell" {
-                let cellSpans = collectCellSpans(cell, textStyles: textStyles)
+                let cellSpans = collectCellSpans(cell, textStyles: textStyles, notes: notes)
                 guard !cellSpans.isEmpty else { continue }
                 if rowHasContent { spans.append(Span(text: "\t")) }
                 spans.append(contentsOf: cellSpans)
@@ -317,7 +411,20 @@ enum OdtReader {
     /// `allDescendants("a:blip")` walk for the same reason: an image must never be dropped just
     /// because of an intermediate wrapper this reader doesn't specifically name.
     private static func collectImages(in node: XMLNode, archive: ZipArchive) -> [OfficeBlock] {
-        node.allDescendants("draw:frame").compactMap { frame in
+        var frames: [XMLNode] = []
+        // A hand-rolled walk, not `allDescendants("draw:frame")` — a `text:note` sitting inside this
+        // paragraph (the citation) carries its OWN body, parsed and rendered separately by
+        // `buildNoteBlocks`; searching blindly into it here would pull an image that belongs to the
+        // FOOTNOTE into the citing paragraph's own image list, duplicating it in the wrong place.
+        func walk(_ node: XMLNode) {
+            for child in node.children {
+                if child.name == "text:note" { continue }
+                if child.name == "draw:frame" { frames.append(child) }
+                walk(child)
+            }
+        }
+        walk(node)
+        return frames.compactMap { frame in
             guard let image = frame.child("draw:image") else { return nil }
             let width = frame.attributes["svg:width"].flatMap(parseLength)
             let height = frame.attributes["svg:height"].flatMap(parseLength)
@@ -376,7 +483,9 @@ enum OdtReader {
     /// alongside but separately from `style`, because a hyperlink target comes from `text:a`'s own
     /// `xlink:href` attribute, not from any named style — it narrows the same way (a `text:a` with
     /// no `xlink:href` at all just carries the enclosing link, if any, rather than losing it).
-    private static func collectSpans(in node: XMLNode, style: TextStyle, textStyles: [String: TextStyle]) -> [Span] {
+    private static func collectSpans(
+        in node: XMLNode, style: TextStyle, textStyles: [String: TextStyle], notes: NoteCollector
+    ) -> [Span] {
         var spans: [Span] = []
         func appendMerging(_ text: String, _ style: TextStyle, _ link: String?) {
             guard !text.isEmpty else { return }
@@ -410,6 +519,35 @@ enum OdtReader {
                     appendMerging("\n", style, link)
                 case "draw:frame":
                     continue // images are collected separately by `collectImages`
+                case "text:note":
+                    // The citation's own marker (`text:note-citation`'s literal text — never
+                    // recomputed for a well-formed note, see `noteCitationText`) is emitted right
+                    // here as a superscript span, exactly where Word/LibreOffice draw it. A note
+                    // missing `text:note-citation` entirely (malformed — ODF requires one) falls
+                    // back to `notes.fallbackCounter`, a plain sequential count in citation order,
+                    // rather than showing a blank marker or crashing.
+                    //
+                    // `text:note-body` — the note's full text — is deliberately NOT walked from
+                    // here: doing so would splice the footnote's own sentence(s) into the middle of
+                    // the CITING paragraph, which is precisely the corruption `read()`'s
+                    // `buildNoteBlocks` exists to avoid. A note with no `text:note-body` at all
+                    // (also malformed) contributes nothing to `notes.entries` — its marker still
+                    // shows here, honestly, but there is no body text to fabricate. That body, when
+                    // present, is rendered once, detached, at the document's end instead.
+                    let citation = noteCitationText(child)
+                    let marker: String
+                    if citation.isEmpty {
+                        marker = "\(notes.fallbackCounter)"
+                        notes.fallbackCounter += 1
+                    } else {
+                        marker = citation
+                    }
+                    if let body = child.child("text:note-body") {
+                        notes.entries.append((marker, body))
+                    }
+                    var markerStyle = TextStyle()
+                    markerStyle.superscript = true
+                    appendMerging(marker, markerStyle, link)
                 case "text:bookmark-start", "text:bookmark-end", "text:bookmark", "office:annotation",
                      "office:annotation-end", "text:soft-page-break":
                     continue // markers with no renderable text of their own

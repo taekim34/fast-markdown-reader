@@ -20,12 +20,14 @@ final class DocxReaderTests: XCTestCase {
     /// at all omits the `.rels` part too — several tests below exercise both).
     private func buildDocx(
         document: String, styles: String? = nil, numbering: String? = nil, rels: String? = nil,
-        media: [(name: String, bytes: [UInt8])] = []
+        footnotes: String? = nil, endnotes: String? = nil, media: [(name: String, bytes: [UInt8])] = []
     ) -> Data {
         var entries: [(String, Data)] = [("word/document.xml", Data(document.utf8))]
         if let styles { entries.append(("word/styles.xml", Data(styles.utf8))) }
         if let numbering { entries.append(("word/numbering.xml", Data(numbering.utf8))) }
         if let rels { entries.append(("word/_rels/document.xml.rels", Data(rels.utf8))) }
+        if let footnotes { entries.append(("word/footnotes.xml", Data(footnotes.utf8))) }
+        if let endnotes { entries.append(("word/endnotes.xml", Data(endnotes.utf8))) }
         for (name, bytes) in media { entries.append(("word/media/" + name, Data(bytes))) }
         return buildZip(entries)
     }
@@ -86,8 +88,11 @@ final class DocxReaderTests: XCTestCase {
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?><w:document><w:body>\(body)</w:body></w:document>"
     }
 
-    private func read(document: String, styles: String? = nil, numbering: String? = nil) throws -> [OfficeBlock] {
-        let zip = buildDocx(document: doc(document), styles: styles, numbering: numbering)
+    private func read(
+        document: String, styles: String? = nil, numbering: String? = nil, footnotes: String? = nil,
+        endnotes: String? = nil
+    ) throws -> [OfficeBlock] {
+        let zip = buildDocx(document: doc(document), styles: styles, numbering: numbering, footnotes: footnotes, endnotes: endnotes)
         let archive = try ZipArchive(data: zip)
         return try DocxReader.read(archive)
     }
@@ -929,5 +934,145 @@ final class DocxReaderTests: XCTestCase {
     func testMissingStylesXMLStillParsesWithNoHeadingsAndNoCrash() throws {
         let blocks = try read(document: "<w:p><w:r><w:t>Plain text</w:t></w:r></w:p>")
         XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Plain text")])])
+    }
+
+    // MARK: Footnotes / endnotes
+    //
+    // NOTE ON EVIDENCE: unlike the table/list/hyperlink fixtures elsewhere in this file, none of
+    // this section is corpus-backed. All eight of the user's real contracts carry a
+    // `word/footnotes.xml` part, but every one of them holds ONLY the two boilerplate entries Word
+    // writes into essentially every document (`w:type="separator"`/`"continuationSeparator"`) — zero
+    // real footnotes, zero `w:footnoteReference` in any of their bodies, measured before this sprint
+    // was written. These fixtures are synthetic, built from the OOXML spec shape, not from a
+    // measured file.
+
+    private func footnoteReferenceRun(id: String) -> String {
+        "<w:r><w:rPr><w:rStyle w:val=\"FootnoteReference\"/></w:rPr><w:footnoteReference w:id=\"\(id)\"/></w:r>"
+    }
+
+    private func endnoteReferenceRun(id: String) -> String {
+        "<w:r><w:rPr><w:rStyle w:val=\"EndnoteReference\"/></w:rPr><w:endnoteReference w:id=\"\(id)\"/></w:r>"
+    }
+
+    /// The two boilerplate separator entries every real docx carries, plus zero or more real notes.
+    private func footnotesXML(_ notes: [(id: String, text: String)]) -> String {
+        var body = """
+        <w:footnote w:type="separator" w:id="-1"><w:p/></w:footnote>
+        <w:footnote w:type="continuationSeparator" w:id="0"><w:p/></w:footnote>
+        """
+        for note in notes {
+            body += """
+            <w:footnote w:id="\(note.id)">
+              <w:p>
+                <w:r><w:rPr><w:rStyle w:val="FootnoteReference"/></w:rPr><w:footnoteRef/></w:r>
+                <w:r><w:t>\(note.text)</w:t></w:r>
+              </w:p>
+            </w:footnote>
+            """
+        }
+        return "<w:footnotes>\(body)</w:footnotes>"
+    }
+
+    private func endnotesXML(_ notes: [(id: String, text: String)]) -> String {
+        var body = """
+        <w:endnote w:type="separator" w:id="-1"><w:p/></w:endnote>
+        <w:endnote w:type="continuationSeparator" w:id="0"><w:p/></w:endnote>
+        """
+        for note in notes {
+            body += """
+            <w:endnote w:id="\(note.id)">
+              <w:p>
+                <w:r><w:rPr><w:rStyle w:val="EndnoteReference"/></w:rPr><w:endnoteRef/></w:r>
+                <w:r><w:t>\(note.text)</w:t></w:r>
+              </w:p>
+            </w:endnote>
+            """
+        }
+        return "<w:endnotes>\(body)</w:endnotes>"
+    }
+
+    func testFootnoteReferenceEmitsSuperscriptMarkerAndBodyIsAppendedAtDocumentEnd() throws {
+        let blocks = try read(
+            document: "<w:p><w:r><w:t>See note</w:t></w:r>\(footnoteReferenceRun(id: "1"))</w:p>",
+            footnotes: footnotesXML([(id: "1", text: " Note text.")]))
+        XCTAssertEqual(blocks, [
+            .paragraph(spans: [Span(text: "See note"), Span(text: "1", superscript: true)]),
+            .paragraph(spans: [Span(text: "1", superscript: true), Span(text: " Note text.")]),
+        ])
+    }
+
+    /// The single concrete bug this sprint exists to avoid: a reader that renders every `w:footnote`
+    /// it finds appends two phantom notes to every real contract, none of which has any actual
+    /// footnotes. `w:type` is the only reliable filter (see `DocxReader.parseNoteBodies`).
+    func testDocumentWithOnlyBoilerplateSeparatorEntriesAndNoRealFootnoteAppendsNothing() throws {
+        let blocks = try read(
+            document: "<w:p><w:r><w:t>Plain paragraph, no citations.</w:t></w:r></w:p>",
+            footnotes: footnotesXML([]))
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Plain paragraph, no citations.")])])
+    }
+
+    /// Numbers are assigned by CITATION order in the body, not by the `w:id` values Word happened to
+    /// assign — real documents can delete/reorder footnotes leaving non-sequential/out-of-order ids
+    /// behind, but the reader must still display "1", "2", … in reading order, matching what Word
+    /// itself shows.
+    func testFootnotesAreNumberedByCitationOrderNotByIdValue() throws {
+        let blocks = try read(
+            document: """
+            <w:p><w:r><w:t>First</w:t></w:r>\(footnoteReferenceRun(id: "9"))</w:p>
+            <w:p><w:r><w:t>Second</w:t></w:r>\(footnoteReferenceRun(id: "3"))</w:p>
+            """,
+            footnotes: footnotesXML([(id: "3", text: " Third note."), (id: "9", text: " Ninth note.")]))
+        XCTAssertEqual(blocks, [
+            .paragraph(spans: [Span(text: "First"), Span(text: "1", superscript: true)]),
+            .paragraph(spans: [Span(text: "Second"), Span(text: "2", superscript: true)]),
+            .paragraph(spans: [Span(text: "1", superscript: true), Span(text: " Ninth note.")]),
+            .paragraph(spans: [Span(text: "2", superscript: true), Span(text: " Third note.")]),
+        ])
+    }
+
+    /// Footnotes and endnotes are separate numbering sequences in Word (both commonly start at 1) —
+    /// this asserts they don't share one counter, and that both kinds of note body are appended, in
+    /// the order they were cited.
+    func testFootnotesAndEndnotesAreNumberedIndependentlyAndBothAppendedInCitationOrder() throws {
+        let blocks = try read(
+            document: """
+            <w:p><w:r><w:t>A footnote</w:t></w:r>\(footnoteReferenceRun(id: "1"))</w:p>
+            <w:p><w:r><w:t>An endnote</w:t></w:r>\(endnoteReferenceRun(id: "1"))</w:p>
+            """,
+            footnotes: footnotesXML([(id: "1", text: " Footnote body.")]),
+            endnotes: endnotesXML([(id: "1", text: " Endnote body.")]))
+        XCTAssertEqual(blocks, [
+            .paragraph(spans: [Span(text: "A footnote"), Span(text: "1", superscript: true)]),
+            .paragraph(spans: [Span(text: "An endnote"), Span(text: "1", superscript: true)]),
+            .paragraph(spans: [Span(text: "1", superscript: true), Span(text: " Footnote body.")]),
+            .paragraph(spans: [Span(text: "1", superscript: true), Span(text: " Endnote body.")]),
+        ])
+    }
+
+    /// A `w:footnoteReference` whose id never appears in `footnotes.xml` at all (malformed/edited
+    /// document) still shows its citation marker — honest, since something WAS cited there — but
+    /// fabricates no body text, since there is none to show.
+    func testFootnoteReferenceWithNoMatchingBodyStillShowsMarkerButAppendsNothing() throws {
+        let blocks = try read(
+            document: "<w:p><w:r><w:t>Orphaned citation</w:t></w:r>\(footnoteReferenceRun(id: "1"))</w:p>",
+            footnotes: footnotesXML([]))
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Orphaned citation"), Span(text: "1", superscript: true)])])
+    }
+
+    /// A footnote reference isn't only ever inside a plain body paragraph — Word allows one inside a
+    /// table cell just as freely, and `collectCellSpans`/`collectSpans` must thread the same
+    /// numbering through there too.
+    func testFootnoteReferenceInsideATableCellIsNumberedAndAppended() throws {
+        let blocks = try read(
+            document: """
+            <w:tbl>
+              <w:tr><w:tc><w:p><w:r><w:t>Cell text</w:t></w:r>\(footnoteReferenceRun(id: "1"))</w:p></w:tc></w:tr>
+            </w:tbl>
+            """,
+            footnotes: footnotesXML([(id: "1", text: " Cell footnote.")]))
+        XCTAssertEqual(blocks, [
+            .table(rows: [[Cell(spans: [Span(text: "Cell text"), Span(text: "1", superscript: true)])]], headerRows: 0),
+            .paragraph(spans: [Span(text: "1", superscript: true), Span(text: " Cell footnote.")]),
+        ])
     }
 }
