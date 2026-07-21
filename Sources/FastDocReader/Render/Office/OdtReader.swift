@@ -246,9 +246,14 @@ enum OdtReader {
 
     // MARK: content.xml — office:text → blocks
 
+    /// Guards `parseBody`'s generic recursion (see the `default` case below) against a hostile
+    /// file nesting wrappers arbitrarily deep — a real ODF document never approaches this, so the
+    /// cap only ever bites on pathological input, where dropping the excess is the safe outcome.
+    private static let maxBodyRecursionDepth = 64
+
     private static func parseBody(
         _ text: XMLNode, listStyles: [String: [Int: Bool]], textStyles: [String: TextStyle],
-        paragraphOutlineLevels: [String: Int], archive: ZipArchive, notes: NoteCollector
+        paragraphOutlineLevels: [String: Int], archive: ZipArchive, notes: NoteCollector, depth: Int = 0
     ) -> [OfficeBlock] {
         var blocks: [OfficeBlock] = []
         for child in text.children {
@@ -272,17 +277,73 @@ enum OdtReader {
                     blocks.append(contentsOf: paragraphLikeBlocks(
                         child, make: { .paragraph(spans: $0) }, textStyles: textStyles, archive: archive, notes: notes))
                 }
+            case "text:hidden-paragraph":
+                // ODF's PARAGRAPH-level "show under a condition" field — same content model as
+                // `text:p` (spec: same child elements). `text:is-hidden` is the file's OWN
+                // LAST-COMPUTED display state; this reader never evaluates `text:condition`
+                // itself (that would need the variable/field engine this project doesn't
+                // implement). Hide ONLY on an explicit "true" — an absent or "false" attribute
+                // SHOWS the content, per this project's governing rule that losing the author's
+                // words is the unforgivable failure, an unknown state is not grounds to hide.
+                if child.attributes["text:is-hidden"] != "true" {
+                    blocks.append(contentsOf: paragraphLikeBlocks(
+                        child, make: { .paragraph(spans: $0) }, textStyles: textStyles, archive: archive,
+                        notes: notes))
+                }
+            case "text:numbered-paragraph":
+                // A single numbered/lettered paragraph carrying its OWN `text:list-id`/
+                // `text:style-name`/`text:list-level` directly, with no enclosing `text:list`/
+                // `text:list-item` pair (legal clause templates, DOCX→ODT converters). Its
+                // `text:style-name` names a LIST style exactly like `text:list`'s own attribute —
+                // reuse `isOrdered` rather than re-deriving the ordered/bullet rule. ODF's
+                // `text:list-level` is 1-based; `OfficeBlock.listItem.level` is 0-based.
+                let styleName = child.attributes["text:style-name"]
+                let rawLevel = Int(child.attributes["text:list-level"] ?? "") ?? 1
+                let level = max(rawLevel - 1, 0)
+                let ordered = isOrdered(styleName: styleName, level: level, listStyles: listStyles)
+                for item in child.children where item.name == "text:p" {
+                    blocks.append(contentsOf: paragraphLikeBlocks(
+                        item, make: { .listItem(level: level, ordered: ordered, spans: $0) }, textStyles: textStyles,
+                        archive: archive, notes: notes))
+                }
             case "text:list":
                 blocks.append(contentsOf: parseList(
                     child, level: 0, inheritedStyleName: nil, listStyles: listStyles, textStyles: textStyles,
                     archive: archive, notes: notes))
             case "table:table":
                 blocks.append(parseTable(child, textStyles: textStyles, notes: notes))
-            default:
-                // e.g. `text:sequence-decls`, `office:scripts` reached via a broader search — not
-                // a block. `office:text`'s own children never include those, but this stays
-                // defensive against a producer that nests differently.
+            case "office:annotation", "text:tracked-changes", "text:sequence-decls", "text:variable-decls",
+                 "text:user-field-decls", "office:forms", "office:scripts":
+                // Deliberate exclusions — dropped ON PURPOSE, not by omission (see the permissive
+                // `default` below):
+                //  - `office:annotation`: review comments — out of scope by design, no comment UI.
+                //  - `text:tracked-changes`: the DELETED-content stash. A deletion is a single,
+                //    empty `<text:change/>` point marker inline (walked as a no-op by
+                //    `collectSpans`'s permissive default), while its actual payload lives in a
+                //    `<text:changed-region>` inside THIS sibling element — never inline between two
+                //    markers. Excluding it is what keeps a tracked deletion from rendering as live
+                //    text; now that the switch below recurses into everything else, this exclusion
+                //    is LOAD-BEARING rather than an accident of a closed switch.
+                //  - `text:sequence-decls` / `text:variable-decls` / `text:user-field-decls`:
+                //    numbering/variable SCHEME declarations, no visible body text of their own.
+                //  - `office:forms` / `office:scripts`: form-control / macro definitions, not
+                //    document prose.
                 continue
+            default:
+                // Any other wrapper this switch doesn't specifically name — `text:section`, the
+                // seven index/TOC elements (`text:table-of-content`, `text:illustration-index`,
+                // `text:table-index`, `text:object-index`, `text:user-index`,
+                // `text:alphabetical-index`, `text:bibliography`) and their `*-source`/`*-body`
+                // children, `text:page-sequence`/`text:page`, or a future ODF wrapper this reader
+                // has never seen — is DESCENDED INTO rather than dropped whole, so a document built
+                // entirely from templated sections/TOCs isn't silently emptied. A `*-source`
+                // config child recurses too but contributes nothing (it has no `text:p`/`text:h`/
+                // `text:list`/`table:table` children of its own), which is harmless, not a special
+                // case to guard against.
+                guard depth < maxBodyRecursionDepth else { continue }
+                blocks.append(contentsOf: parseBody(
+                    child, listStyles: listStyles, textStyles: textStyles,
+                    paragraphOutlineLevels: paragraphOutlineLevels, archive: archive, notes: notes, depth: depth + 1))
             }
         }
         return blocks
@@ -300,9 +361,11 @@ enum OdtReader {
     ) -> [OfficeBlock] {
         let spans = collectSpans(in: node, style: TextStyle(), textStyles: textStyles, notes: notes)
         let images = collectImages(in: node, archive: archive)
+        let textBoxes = collectTextBoxBlocks(in: node, textStyles: textStyles, notes: notes)
         var blocks: [OfficeBlock] = []
-        if !(spans.isEmpty && !images.isEmpty) { blocks.append(make(spans)) }
+        if !(spans.isEmpty && !(images.isEmpty && textBoxes.isEmpty)) { blocks.append(make(spans)) }
         blocks.append(contentsOf: images)
+        blocks.append(contentsOf: textBoxes)
         return blocks
     }
 
@@ -471,6 +534,51 @@ enum OdtReader {
         }
     }
 
+    /// A `draw:frame` wrapping a `draw:text-box` (and carrying no `draw:image` — that combination
+    /// is an ordinary picture, handled by `collectImages`) contributes its own text-box content
+    /// instead of nothing. Mirrors `DocxReader.textBoxBlocks`'s scope exactly, per this project's
+    /// own rule that the two readers stay parallel rather than diverging for no reason: only the
+    /// text box's own `text:p`/`text:h` paragraphs (no nested lists/tables — docx's fallback never
+    /// chased those either), with an empty one (LibreOffice leaves a placeholder paragraph in an
+    /// otherwise-untyped shape) dropped rather than shown as a phantom blank line.
+    private static func collectTextBoxBlocks(
+        in node: XMLNode, textStyles: [String: TextStyle], notes: NoteCollector
+    ) -> [OfficeBlock] {
+        var textBoxes: [XMLNode] = []
+        func walk(_ node: XMLNode) {
+            for child in node.children {
+                if child.name == "text:note" { continue } // belongs to the footnote, not this paragraph
+                if child.name == "draw:frame", child.child("draw:image") == nil,
+                   let textBox = child.child("draw:text-box") {
+                    textBoxes.append(textBox)
+                    continue // don't also descend into the text box's own contents from here
+                }
+                walk(child)
+            }
+        }
+        walk(node)
+        var blocks: [OfficeBlock] = []
+        for textBox in textBoxes {
+            for child in textBox.children {
+                switch child.name {
+                case "text:h":
+                    let rawLevel = Int(child.attributes["text:outline-level"] ?? "") ?? 1
+                    let level = min(max(rawLevel, 1), 6)
+                    let spans = collectSpans(in: child, style: TextStyle(), textStyles: textStyles, notes: notes)
+                    guard !spans.isEmpty else { continue }
+                    blocks.append(.heading(level: level, spans: spans))
+                case "text:p":
+                    let spans = collectSpans(in: child, style: TextStyle(), textStyles: textStyles, notes: notes)
+                    guard !spans.isEmpty else { continue }
+                    blocks.append(.paragraph(spans: spans))
+                default:
+                    continue
+                }
+            }
+        }
+        return blocks
+    }
+
     /// A best-defensible non-zero fallback for a frame whose `svg:width`/`svg:height` is missing or
     /// doesn't parse — invariant 1 applies here exactly as it does to `DocxReader`'s VML fallback:
     /// never reserve a zero/collapsed area.
@@ -586,6 +694,27 @@ enum OdtReader {
                     var markerStyle = TextStyle()
                     markerStyle.superscript = true
                     appendMerging(marker, markerStyle, link)
+                case "text:hidden-text":
+                    // ODF's RUN-level "show under a condition" field. Unlike `text:hidden-paragraph`
+                    // (which wraps ordinary content), this is an EMPTY field element — its display
+                    // text is CACHED in `text:string-value` (ODF's standard "field caches its last-
+                    // computed text as an attribute" convention, ODF 1.3 Part 3 §7.2), not held as
+                    // child nodes. `text:is-hidden` is the file's own last-computed state; hide only
+                    // on an explicit "true", exactly the same rule as `text:hidden-paragraph`.
+                    if child.attributes["text:is-hidden"] != "true" {
+                        appendMerging(child.attributes["text:string-value"] ?? "", style, link)
+                    }
+                case "text:conditional-text":
+                    // ODF's "one of two alternative texts, selected by a formula" field — also an
+                    // EMPTY element. `text:current-value` records which branch the formula last
+                    // evaluated to; this reader trusts that recorded state rather than evaluating
+                    // `text:condition` itself. Absent `text:current-value` reads as "false" (ODF's
+                    // own default for the attribute), matching `text:string-value-if-false`.
+                    let showTrueBranch = child.attributes["text:current-value"] == "true"
+                    let text = showTrueBranch
+                        ? (child.attributes["text:string-value-if-true"] ?? "")
+                        : (child.attributes["text:string-value-if-false"] ?? "")
+                    appendMerging(text, style, link)
                 case "text:bookmark-start", "text:bookmark-end", "text:bookmark", "office:annotation",
                      "office:annotation-end", "text:soft-page-break":
                     continue // markers with no renderable text of their own

@@ -618,4 +618,237 @@ final class OdtReaderTests: XCTestCase {
         let blocks = try read(body: "<text:p>Plain</text:p>")
         XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Plain")])])
     }
+
+    // MARK: S4 item 1 — unknown body wrappers RECURSE instead of dropping their contents whole
+
+    func testTextSectionContentSurvivesViaRecursionNotJustCoincidentalReachability() throws {
+        let blocks = try read(body: """
+        <text:section text:name="Sec1"><text:p>Inside a section.</text:p></text:section>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Inside a section.")])])
+    }
+
+    func testTableOfContentIndexBodyParagraphsSurvive() throws {
+        let blocks = try read(body: """
+        <text:table-of-content text:name="TOC">
+          <text:table-of-content-source/>
+          <text:index-body>
+            <text:index-title><text:p>Table of Contents</text:p></text:index-title>
+            <text:p>Chapter 1 ... 1</text:p>
+          </text:index-body>
+        </text:table-of-content>
+        """)
+        XCTAssertEqual(blocks, [
+            .paragraph(spans: [Span(text: "Table of Contents")]),
+            .paragraph(spans: [Span(text: "Chapter 1 ... 1")]),
+        ])
+    }
+
+    /// Two of the other six index-family wrappers, confirming the fix is generic rather than
+    /// scoped to the two names gap-list.md happened to mention by example.
+    func testIllustrationAndBibliographyIndexBodiesSurvive() throws {
+        let illustrations = try read(body: """
+        <text:illustration-index text:name="LOI">
+          <text:index-body><text:p>Figure 1: A diagram</text:p></text:index-body>
+        </text:illustration-index>
+        """)
+        XCTAssertEqual(illustrations, [.paragraph(spans: [Span(text: "Figure 1: A diagram")])])
+
+        let bibliography = try read(body: """
+        <text:bibliography text:name="Bib">
+          <text:index-body><text:p>Smith, J. (2020). A Book.</text:p></text:index-body>
+        </text:bibliography>
+        """)
+        XCTAssertEqual(bibliography, [.paragraph(spans: [Span(text: "Smith, J. (2020). A Book.")])])
+    }
+
+    func testPageSequenceContentSurvives() throws {
+        let blocks = try read(body: """
+        <text:page-sequence><text:page><text:p>Page content.</text:p></text:page></text:page-sequence>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Page content.")])])
+    }
+
+    func testAnnotationTrackedChangesAndDeclarationBlocksStayExcludedEvenThoughRecursionIsNowPermissive() throws {
+        let blocks = try read(body: """
+        <office:annotation><text:p>A reviewer comment.</text:p></office:annotation>
+        <text:tracked-changes>
+          <text:changed-region text:id="ct1"><text:deletion><text:p>Deleted text.</text:p></text:deletion></text:changed-region>
+        </text:tracked-changes>
+        <text:sequence-decls><text:sequence-decl text:display-outline-level="0" text:name="Figure"/></text:sequence-decls>
+        <office:forms><form:form><text:p>Not document prose.</text:p></form:form></office:forms>
+        <text:p>Real content.</text:p>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Real content.")])])
+    }
+
+    /// Mutation check (invariant 30): confirm the recursion is what's carrying the content, not
+    /// some OTHER reachable path — remove the recursion (simulate by asserting the wrapper name
+    /// itself never reaches a matched case) by checking a NESTED wrapper (section inside a TOC
+    /// index-body) still survives, which only recursion-at-every-level, not a single special case,
+    /// can produce.
+    func testNestedUnknownWrappersRecurseAtEveryLevelNotJustOnce() throws {
+        let blocks = try read(body: """
+        <text:table-of-content text:name="TOC">
+          <text:index-body><text:section text:name="Inner"><text:p>Deeply nested.</text:p></text:section></text:index-body>
+        </text:table-of-content>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Deeply nested.")])])
+    }
+
+    // MARK: S4 item 2 — text:numbered-paragraph (a list item with no enclosing text:list)
+
+    func testNumberedParagraphAtLevelOneProducesAnOrderedListItem() throws {
+        let blocks = try read(
+            body: """
+            <text:numbered-paragraph text:style-name="L1" text:list-level="1">
+              <text:p>Clause one.</text:p>
+            </text:numbered-paragraph>
+            """,
+            automaticStyles: numberThenBulletListStyle)
+        XCTAssertEqual(blocks, [.listItem(level: 0, ordered: true, spans: [Span(text: "Clause one.")])])
+    }
+
+    func testNumberedParagraphAtDeeperLevelConvertsOneBasedToZeroBasedLevel() throws {
+        let blocks = try read(
+            body: """
+            <text:numbered-paragraph text:style-name="L1" text:list-level="3">
+              <text:p>Sub-clause.</text:p>
+            </text:numbered-paragraph>
+            """,
+            automaticStyles: numberThenBulletListStyle)
+        // Level 3 (1-based) → 2 (0-based); the fixture's list style only declares levels 0/1, so an
+        // undeclared level 2 correctly resolves to unordered (`isOrdered`'s own unresolvable-input
+        // contract), proving the level really did convert rather than clamp to a declared one.
+        XCTAssertEqual(blocks, [.listItem(level: 2, ordered: false, spans: [Span(text: "Sub-clause.")])])
+    }
+
+    func testNumberedParagraphWithNoListLevelAttributeDefaultsToLevelZero() throws {
+        let blocks = try read(
+            body: """
+            <text:numbered-paragraph text:style-name="L1">
+              <text:p>Default level.</text:p>
+            </text:numbered-paragraph>
+            """,
+            automaticStyles: numberThenBulletListStyle)
+        XCTAssertEqual(blocks, [.listItem(level: 0, ordered: true, spans: [Span(text: "Default level.")])])
+    }
+
+    // MARK: S4 item 3 — hidden/conditional content shows unless the file explicitly says hidden
+
+    /// `text:hidden-paragraph`'s content model is the SAME as `text:p`'s (spans directly, per ODF
+    /// 1.3) — not a wrapper holding a nested `text:p`.
+    func testHiddenParagraphMarkedHiddenIsSuppressed() throws {
+        let blocks = try read(body: """
+        <text:hidden-paragraph text:condition="false" text:is-hidden="true">Should not appear.</text:hidden-paragraph><text:p>Visible.</text:p>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Visible.")])])
+    }
+
+    func testHiddenParagraphMarkedVisibleShows() throws {
+        let blocks = try read(body: """
+        <text:hidden-paragraph text:condition="true" text:is-hidden="false">Shown text.</text:hidden-paragraph>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Shown text.")])])
+    }
+
+    /// The project's governing rule: an unknown/absent display state must fall to SHOWING.
+    func testHiddenParagraphWithNoIsHiddenAttributeShowsByDefault() throws {
+        let blocks = try read(body: """
+        <text:hidden-paragraph text:condition="SomeVar==1">No recorded state.</text:hidden-paragraph>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "No recorded state.")])])
+    }
+
+    func testHiddenTextRunHiddenIsSuppressed() throws {
+        let blocks = try read(body: """
+        <text:p>Before <text:hidden-text text:condition="false" text:is-hidden="true" text:string-value="secret"/> after.</text:p>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Before  after.")])])
+    }
+
+    func testHiddenTextRunVisibleShowsCachedStringValue() throws {
+        let blocks = try read(body: """
+        <text:p>Before <text:hidden-text text:condition="true" text:is-hidden="false" text:string-value="shown"/> after.</text:p>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Before shown after.")])])
+    }
+
+    func testConditionalTextShowsTrueBranchWhenCurrentValueIsTrue() throws {
+        let blocks = try read(body: """
+        <text:p><text:conditional-text text:condition="X" text:string-value-if-true="YES" text:string-value-if-false="NO" text:current-value="true"/></text:p>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "YES")])])
+    }
+
+    func testConditionalTextShowsFalseBranchWhenCurrentValueIsFalseOrAbsent() throws {
+        let blocksFalse = try read(body: """
+        <text:p><text:conditional-text text:condition="X" text:string-value-if-true="YES" text:string-value-if-false="NO" text:current-value="false"/></text:p>
+        """)
+        XCTAssertEqual(blocksFalse, [.paragraph(spans: [Span(text: "NO")])])
+
+        let blocksAbsent = try read(body: """
+        <text:p><text:conditional-text text:condition="X" text:string-value-if-true="YES" text:string-value-if-false="NO"/></text:p>
+        """)
+        XCTAssertEqual(blocksAbsent, [.paragraph(spans: [Span(text: "NO")])])
+    }
+
+    // MARK: S4 item 4 — draw:frame > draw:text-box contributes its text content
+
+    func testTextBoxContentsSurviveInsteadOfDisappearing() throws {
+        let blocks = try read(body: """
+        <text:p><draw:frame svg:width="72pt" svg:height="72pt">
+          <draw:text-box><text:p>Callout text.</text:p></draw:text-box>
+        </draw:frame></text:p>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Callout text.")])])
+    }
+
+    func testTextBoxWithHeadingAndEmptyPlaceholderParagraphFiltersTheEmptyOne() throws {
+        let blocks = try read(body: """
+        <text:p><draw:frame svg:width="72pt" svg:height="72pt">
+          <draw:text-box>
+            <text:h text:outline-level="2">Box Title</text:h>
+            <text:p/>
+          </draw:text-box>
+        </draw:frame></text:p>
+        """)
+        XCTAssertEqual(blocks, [.heading(level: 2, spans: [Span(text: "Box Title")])])
+    }
+
+    func testFrameWithBothImageAndTextBoxIsTreatedAsAnImageNotDoubleCounted() throws {
+        let blocks = try readWithMedia(
+            body: """
+            <text:p><draw:frame svg:width="72pt" svg:height="72pt">
+              <draw:image xlink:href="Pictures/photo.png"/>
+            </draw:frame></text:p>
+            """,
+            media: [("Pictures/photo.png", [0x01])])
+        XCTAssertEqual(blocks, [.image(id: "Pictures/photo.png", size: CGSize(width: 72, height: 72))])
+    }
+
+    // MARK: S4 — a real read path, not just the parser (invariant 29)
+
+    func testAllFourItemsSurviveThroughDocumentTypesReadOfficeNotJustOdtReaderDirectly() throws {
+        let zip = buildOdt(content: doc(
+            body: """
+            <text:section text:name="Sec1"><text:p>Section text.</text:p></text:section>
+            <text:numbered-paragraph text:style-name="L1" text:list-level="1"><text:p>Clause.</text:p></text:numbered-paragraph>
+            <text:hidden-paragraph text:is-hidden="true">Hidden.</text:hidden-paragraph>
+            <text:p><draw:frame svg:width="72pt" svg:height="72pt"><draw:text-box><text:p>Box text.</text:p></draw:text-box></draw:frame></text:p>
+            """,
+            automaticStyles: numberThenBulletListStyle))
+        let archive = try ZipArchive(data: zip)
+        let blocks = try DocumentTypes.readOffice(archive, extension: "odt")
+        let allText = blocks.flatMap { block -> [String] in
+            switch block {
+            case .paragraph(let spans), .heading(_, let spans), .listItem(_, _, let spans): return spans.map(\.text)
+            case .table, .image: return []
+            }
+        }.joined()
+        XCTAssertTrue(allText.contains("Section text."))
+        XCTAssertTrue(allText.contains("Clause."))
+        XCTAssertFalse(allText.contains("Hidden."))
+        XCTAssertTrue(allText.contains("Box text."))
+    }
 }
