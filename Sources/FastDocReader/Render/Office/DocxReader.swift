@@ -32,7 +32,7 @@ enum DocxReader: OfficeDocumentReader {
     /// This reader emits `.image` blocks (see `collectImages`) — PARSING only. Resolving an
     /// emitted id to actual pixels (reading the archive entry, drawing a placeholder for an
     /// unresolvable one) is a later sprint's job.
-    static func read(_ archive: ZipArchive) throws -> [OfficeBlock] {
+    static func read(_ archive: ZipArchive) throws -> OfficeReadResult {
         guard archive.contains("word/document.xml") else { throw ReadError.missingDocumentXML }
         guard let documentRoot = try? buildTree(archive.data(for: "word/document.xml")) else {
             throw ReadError.malformedXML("word/document.xml")
@@ -41,7 +41,7 @@ enum DocxReader: OfficeDocumentReader {
         let styleInfo = parseStyles(from: archive, themeColors: themeColors)
         let numbering = parseNumbering(from: archive)
         let relationships = parseRelationships(from: archive)
-        guard let body = documentRoot.child("w:body") else { return [] }
+        guard let body = documentRoot.child("w:body") else { return OfficeReadResult(blocks: []) }
         // Footnote/endnote numbering is resolved BEFORE the body is walked for real: Word doesn't
         // stamp an explicit display number on `w:footnoteReference`/`w:endnoteReference` (unlike
         // ODF's `text:note-citation`, which literally contains its own marker text) — the number is
@@ -51,21 +51,27 @@ enum DocxReader: OfficeDocumentReader {
         // would display.
         let (footnoteNumberById, endnoteNumberById, citationOrder) = numberNoteReferences(in: body)
         let notes = NoteNumbering(footnote: footnoteNumberById, endnote: endnoteNumberById)
+        // Comment RANGE numbering — same "resolve positional numbering in a first pass" approach as
+        // footnotes/endnotes above, from the order `w:commentRangeStart` ids first appear in the
+        // body (see `CommentRangeTracking`'s own doc for why this is a class, not a struct).
+        let commentNumberById = numberCommentReferences(in: body)
+        let comments = CommentRangeTracking(numberById: commentNumberById)
         // ONE numbering-counter state for the whole read() call — body, then footnotes, then
         // endnotes, all walked from here in that order — because a numId's counters belong to the
         // numId, not to which of those three regions a paragraph happens to sit in (see
         // `ListNumberingState`).
         let listState = ListNumberingState()
         let bodyBlocks = parseBody(
-            body, styleInfo: styleInfo, numbering: numbering, relationships: relationships, notes: notes,
+            body, styleInfo: styleInfo, numbering: numbering, relationships: relationships, notes: notes, comments: comments,
             listState: listState)
         let footnoteBodies = parseNoteBodies(from: archive, part: "word/footnotes.xml", noteElementName: "w:footnote")
         let endnoteBodies = parseNoteBodies(from: archive, part: "word/endnotes.xml", noteElementName: "w:endnote")
         let noteBlocks = collectNoteBlocks(
             citationOrder: citationOrder, footnoteBodies: footnoteBodies, endnoteBodies: endnoteBodies,
-            styleInfo: styleInfo, numbering: numbering, relationships: relationships, notes: notes,
+            styleInfo: styleInfo, numbering: numbering, relationships: relationships, notes: notes, comments: comments,
             listState: listState)
-        return bodyBlocks + noteBlocks
+        let officeComments = parseComments(from: archive, numberById: commentNumberById)
+        return OfficeReadResult(blocks: bodyBlocks + noteBlocks, comments: officeComments)
     }
 
     /// The source document's own default BODY run size, in points — `word/styles.xml`'s
@@ -84,6 +90,101 @@ enum DocxReader: OfficeDocumentReader {
               let half = Double(szVal)
         else { return 11 }
         return CGFloat(half / 2)
+    }
+
+    // MARK: Comments (word/comments.xml + w:commentRangeStart/End/Reference)
+
+    /// Shared state for one body walk that tracks currently-OPEN comment ranges
+    /// (`w:commentRangeStart` … `w:commentRangeEnd`) so every `Span` emitted while a range is open
+    /// can carry that comment's id (see `Span.commentIds`). A class, not a struct, because a
+    /// start/end pair is encountered as an isolated, order-dependent side effect deep inside
+    /// `collectSpans`' walk — passing this BY REFERENCE keeps every call site (`parseBody` down to
+    /// `collectSpans`, text boxes, table cells, nested tables) in sync with the same "what's open
+    /// right now" state, the same threading pattern `NoteNumbering` uses for read-only footnote/
+    /// endnote numbers, just mutable. `numberById` is precomputed once, before the walk starts (see
+    /// `numberCommentReferences`), from first-appearance order of `w:commentRangeStart` in the body.
+    private final class CommentRangeTracking {
+        let numberById: [String: Int]
+        private(set) var activeIds: [String] = []
+        init(numberById: [String: Int]) { self.numberById = numberById }
+        func start(_ id: String) { activeIds.append(id) }
+        func end(_ id: String) { activeIds.removeAll { $0 == id } }
+    }
+
+    /// First pass over the body (mirrors `numberNoteReferences`): assigns each comment id the
+    /// 1-based number of the ORDER its `w:commentRangeStart` first appears, document order,
+    /// depth-first — the same number a comment sidebar would show. A comment id that never opens a
+    /// range in the body (comments.xml lists it, but nothing in the body anchors it) is absent from
+    /// this map; `parseComments` assigns it a trailing number, continuing the sequence.
+    private static func numberCommentReferences(in body: XMLNode) -> [String: Int] {
+        var numberById: [String: Int] = [:]
+        var next = 1
+        func walk(_ node: XMLNode) {
+            for child in node.children {
+                if child.name == "w:commentRangeStart", let id = child.attributes["w:id"], numberById[id] == nil {
+                    numberById[id] = next
+                    next += 1
+                }
+                walk(child)
+            }
+        }
+        walk(body)
+        return numberById
+    }
+
+    /// `word/comments.xml` — a flat `w:comments/w:comment` list, each `@w:id`/`@w:author`/`@w:date`
+    /// plus the comment's own `w:p` paragraphs as its text. Absent entirely (no document part) is
+    /// not an error — most documents have no comments — and yields no `OfficeComment`s. `numberById`
+    /// is the SAME body first-pass `read()` already computed (`numberCommentReferences`), so a
+    /// comment actually anchored in the body gets the number matching its anchor; one that ISN'T
+    /// (present in `comments.xml` with no matching `w:commentRangeStart`/`w:commentReference` in the
+    /// body) still lists, numbered by continuing the sequence in comments.xml's own file order — it
+    /// anchors nothing, but the author's comment text is never silently dropped. The final array is
+    /// sorted by `number` so callers see comments in the same order a sidebar would.
+    private static func parseComments(from archive: ZipArchive, numberById: [String: Int]) -> [OfficeComment] {
+        guard archive.contains("word/comments.xml"),
+              let data = try? archive.data(for: "word/comments.xml"),
+              let root = try? buildTree(data)
+        else { return [] }
+        var result: [OfficeComment] = []
+        var nextTrailingNumber = (numberById.values.max() ?? 0) + 1
+        for node in root.children where node.name == "w:comment" {
+            guard let id = node.attributes["w:id"] else { continue }
+            let author = node.attributes["w:author"]
+            let dateISO = node.attributes["w:date"]
+            let text = node.children.filter { $0.name == "w:p" }
+                .map { paragraphPlainText($0) }
+                .joined(separator: "\n")
+            let number: Int
+            if let anchored = numberById[id] {
+                number = anchored
+            } else {
+                number = nextTrailingNumber
+                nextTrailingNumber += 1
+            }
+            result.append(OfficeComment(id: id, author: author, dateISO: dateISO, text: text, number: number))
+        }
+        return result.sorted { $0.number < $1.number }
+    }
+
+    /// A comment's own paragraph, flattened to plain text (no run formatting — `OfficeComment.text`
+    /// carries no `Span`s of its own, unlike a document paragraph) — every `w:t` under this node,
+    /// concatenated, with `w:br`/`w:tab` turned into `\n`/`\t` exactly like `buildSpan`'s own text
+    /// assembly, so a multi-run or wrapped comment reads the same as the author typed it.
+    private static func paragraphPlainText(_ p: XMLNode) -> String {
+        var text = ""
+        func walk(_ node: XMLNode) {
+            for child in node.children {
+                switch child.name {
+                case "w:t": text += child.text
+                case "w:br": text += "\n"
+                case "w:tab": text += "\t"
+                default: walk(child)
+                }
+            }
+        }
+        walk(p)
+        return text
     }
 
     // MARK: Footnotes / endnotes
@@ -169,7 +270,7 @@ enum DocxReader: OfficeDocumentReader {
     private static func collectNoteBlocks(
         citationOrder: [(kind: NoteKind, id: String, number: Int)], footnoteBodies: [String: XMLNode],
         endnoteBodies: [String: XMLNode], styleInfo: StyleInfo, numbering: NumberingInfo,
-        relationships: Relationships, notes: NoteNumbering, listState: ListNumberingState
+        relationships: Relationships, notes: NoteNumbering, comments: CommentRangeTracking, listState: ListNumberingState
     ) -> [OfficeBlock] {
         citationOrder.flatMap { entry -> [OfficeBlock] in
             let noteElement = entry.kind == .footnote ? footnoteBodies[entry.id] : endnoteBodies[entry.id]
@@ -177,7 +278,7 @@ enum DocxReader: OfficeDocumentReader {
             var blocks = noteElement.children.flatMap {
                 parseBodyChild(
                     $0, styleInfo: styleInfo, numbering: numbering, relationships: relationships,
-                    notes: notes, listState: listState)
+                    notes: notes, comments: comments, listState: listState)
             }
             // Never fabricated — this is the SAME marker text emitted at the citation point
             // (`collectSpans`'s `w:footnoteReference`/`w:endnoteReference` case), so a reader can
@@ -1335,7 +1436,7 @@ enum DocxReader: OfficeDocumentReader {
     /// everywhere else in this function).
     private static func collectDrawingBlocks(
         in node: XMLNode, styleInfo: StyleInfo, numbering: NumberingInfo, relationships: Relationships,
-        notes: NoteNumbering, listState: ListNumberingState, allowGraphicPlaceholder: Bool = true
+        notes: NoteNumbering, comments: CommentRangeTracking, listState: ListNumberingState, allowGraphicPlaceholder: Bool = true
     ) -> [OfficeBlock] {
         var blocks: [OfficeBlock] = []
         func walk(_ node: XMLNode) {
@@ -1345,7 +1446,7 @@ enum DocxReader: OfficeDocumentReader {
                     guard let choice = child.child("mc:Choice") else { continue }
                     let choiceBlocks = collectDrawingBlocks(
                         in: choice, styleInfo: styleInfo, numbering: numbering, relationships: relationships,
-                        notes: notes, listState: listState, allowGraphicPlaceholder: false)
+                        notes: notes, comments: comments, listState: listState, allowGraphicPlaceholder: false)
                     if !choiceBlocks.isEmpty {
                         blocks.append(contentsOf: choiceBlocks)
                         continue
@@ -1358,7 +1459,7 @@ enum DocxReader: OfficeDocumentReader {
                     let fallbackBlocks = child.child("mc:Fallback").map {
                         collectDrawingBlocks(
                             in: $0, styleInfo: styleInfo, numbering: numbering, relationships: relationships,
-                            notes: notes, listState: listState, allowGraphicPlaceholder: false)
+                            notes: notes, comments: comments, listState: listState, allowGraphicPlaceholder: false)
                     } ?? []
                     if !fallbackBlocks.isEmpty {
                         blocks.append(contentsOf: fallbackBlocks)
@@ -1375,7 +1476,7 @@ enum DocxReader: OfficeDocumentReader {
                     }
                     let text = textBoxBlocks(
                         in: child, styleInfo: styleInfo, numbering: numbering,
-                        relationships: relationships, notes: notes, listState: listState)
+                        relationships: relationships, notes: notes, comments: comments, listState: listState)
                     if !text.isEmpty {
                         blocks.append(contentsOf: text)
                     } else if allowGraphicPlaceholder, let placeholder = graphicPlaceholderBlock(for: child) {
@@ -1390,7 +1491,7 @@ enum DocxReader: OfficeDocumentReader {
                     } else {
                         blocks.append(contentsOf: textBoxBlocks(
                             in: child, styleInfo: styleInfo, numbering: numbering,
-                            relationships: relationships, notes: notes, listState: listState))
+                            relationships: relationships, notes: notes, comments: comments, listState: listState))
                     }
                 default:
                     walk(child)
@@ -1445,14 +1546,14 @@ enum DocxReader: OfficeDocumentReader {
     /// does not apply to shape decoration.
     private static func textBoxBlocks(
         in node: XMLNode, styleInfo: StyleInfo, numbering: NumberingInfo, relationships: Relationships,
-        notes: NoteNumbering, listState: ListNumberingState
+        notes: NoteNumbering, comments: CommentRangeTracking, listState: ListNumberingState
     ) -> [OfficeBlock] {
         var blocks: [OfficeBlock] = []
         for txbx in node.allDescendants("w:txbxContent") {
             for p in txbx.children where p.name == "w:p" {
                 let paragraphBlocks = parseParagraph(
                     p, styleInfo: styleInfo, numbering: numbering, relationships: relationships,
-                    notes: notes, listState: listState)
+                    notes: notes, comments: comments, listState: listState)
                 blocks.append(contentsOf: paragraphBlocks.filter { !isEmptyTextBlock($0) })
             }
         }
@@ -1669,11 +1770,11 @@ enum DocxReader: OfficeDocumentReader {
 
     private static func parseBody(
         _ body: XMLNode, styleInfo: StyleInfo, numbering: NumberingInfo, relationships: Relationships,
-        notes: NoteNumbering, listState: ListNumberingState
+        notes: NoteNumbering, comments: CommentRangeTracking, listState: ListNumberingState
     ) -> [OfficeBlock] {
         body.children.flatMap {
             parseBodyChild(
-                $0, styleInfo: styleInfo, numbering: numbering, relationships: relationships, notes: notes,
+                $0, styleInfo: styleInfo, numbering: numbering, relationships: relationships, notes: notes, comments: comments,
                 listState: listState)
         }
     }
@@ -1688,23 +1789,23 @@ enum DocxReader: OfficeDocumentReader {
     /// content. Anything else at this level (the body's own trailing `w:sectPr`) is not a block.
     private static func parseBodyChild(
         _ child: XMLNode, styleInfo: StyleInfo, numbering: NumberingInfo, relationships: Relationships,
-        notes: NoteNumbering, listState: ListNumberingState
+        notes: NoteNumbering, comments: CommentRangeTracking, listState: ListNumberingState
     ) -> [OfficeBlock] {
         switch child.name {
         case "w:p":
             return parseParagraph(
                 child, styleInfo: styleInfo, numbering: numbering, relationships: relationships,
-                notes: notes, listState: listState)
+                notes: notes, comments: comments, listState: listState)
         case "w:tbl":
             return [parseTable(
-                child, styleInfo: styleInfo, numbering: numbering, relationships: relationships, notes: notes,
+                child, styleInfo: styleInfo, numbering: numbering, relationships: relationships, notes: notes, comments: comments,
                 listState: listState)]
         case "w:sdt":
             guard let content = child.child("w:sdtContent") else { return [] }
             return content.children.flatMap {
                 parseBodyChild(
                     $0, styleInfo: styleInfo, numbering: numbering, relationships: relationships,
-                    notes: notes, listState: listState)
+                    notes: notes, comments: comments, listState: listState)
             }
         default:
             return []
@@ -1719,7 +1820,7 @@ enum DocxReader: OfficeDocumentReader {
     /// standing in for a picture.
     private static func parseParagraph(
         _ p: XMLNode, styleInfo: StyleInfo, numbering: NumberingInfo, relationships: Relationships,
-        notes: NoteNumbering, listState: ListNumberingState
+        notes: NoteNumbering, comments: CommentRangeTracking, listState: ListNumberingState
     ) -> [OfficeBlock] {
         let pPr = p.child("w:pPr")
         // Read directly off THIS paragraph's own `w:pPr` — not resolved through the `w:basedOn`
@@ -1747,10 +1848,10 @@ enum DocxReader: OfficeDocumentReader {
             }
             return resolvedTabStops(pStyleId: pStyleIdForAlignment, styleInfo: styleInfo) ?? []
         }()
-        let spans = collectSpans(in: p, styleInfo: styleInfo, relationships: relationships, notes: notes)
+        let spans = collectSpans(in: p, styleInfo: styleInfo, relationships: relationships, notes: notes, comments: comments)
         let drawingBlocks = collectDrawingBlocks(
             in: p, styleInfo: styleInfo, numbering: numbering, relationships: relationships,
-            notes: notes, listState: listState)
+            notes: notes, comments: comments, listState: listState)
         // A display equation (`m:oMathPara`) is collected separately from `spans`, not folded into
         // them — `collectSpans` deliberately SKIPS `m:oMathPara` (see its own switch) so its content
         // is never also flattened into plain text there; a bare inline `m:oMath` takes the opposite
@@ -1856,7 +1957,7 @@ enum DocxReader: OfficeDocumentReader {
     /// horizontal merge changes how many `<w:tc>` a row needs without changing the grid it spans).
     private static func parseTable(
         _ tbl: XMLNode, styleInfo: StyleInfo, numbering: NumberingInfo, relationships: Relationships,
-        notes: NoteNumbering, listState: ListNumberingState
+        notes: NoteNumbering, comments: CommentRangeTracking, listState: ListNumberingState
     ) -> OfficeBlock {
         let rowNodes = tbl.children.filter { $0.name == "w:tr" }
         let tblPr = tbl.child("w:tblPr")
@@ -1907,7 +2008,7 @@ enum DocxReader: OfficeDocumentReader {
                     // dropped rather than fabricated into a normal cell.
                 } else {
                     let blocks = collectCellBlocks(
-                        tc, styleInfo: styleInfo, numbering: numbering, relationships: relationships, notes: notes,
+                        tc, styleInfo: styleInfo, numbering: numbering, relationships: relationships, notes: notes, comments: comments,
                         listState: listState)
                     let (borderColor, borderWidth) = cellBorder(tcPr)
                     // Own `w:tcMar` wins; a cell that says nothing inherits the table's own default
@@ -2132,23 +2233,23 @@ enum DocxReader: OfficeDocumentReader {
     /// for "nothing here".
     private static func collectCellBlocks(
         _ tc: XMLNode, styleInfo: StyleInfo, numbering: NumberingInfo, relationships: Relationships,
-        notes: NoteNumbering, listState: ListNumberingState
+        notes: NoteNumbering, comments: CommentRangeTracking, listState: ListNumberingState
     ) -> [OfficeBlock] {
         var blocks: [OfficeBlock] = []
         for child in tc.children {
             switch child.name {
             case "w:p":
                 blocks.append(contentsOf: parseParagraph(
-                    child, styleInfo: styleInfo, numbering: numbering, relationships: relationships, notes: notes,
+                    child, styleInfo: styleInfo, numbering: numbering, relationships: relationships, notes: notes, comments: comments,
                     listState: listState))
             case "w:tbl":
-                let spans = flattenNestedTable(child, styleInfo: styleInfo, relationships: relationships, notes: notes)
+                let spans = flattenNestedTable(child, styleInfo: styleInfo, relationships: relationships, notes: notes, comments: comments)
                 if !spans.isEmpty { blocks.append(.paragraph(spans: spans)) }
             case "w:sdt":
                 if let content = child.child("w:sdtContent") {
                     blocks.append(contentsOf: collectCellBlocks(
                         content, styleInfo: styleInfo, numbering: numbering, relationships: relationships,
-                        notes: notes, listState: listState))
+                        notes: notes, comments: comments, listState: listState))
                 }
             default:
                 continue
@@ -2161,17 +2262,17 @@ enum DocxReader: OfficeDocumentReader {
     /// which deliberately squashes a nested table's grid down to text (`Cell` has no room for a
     /// second, real nested `.table` block). `collectCellBlocks` above is what a table's OWN cells
     /// go through now; this stays exactly as it was for the flatten-only path.
-    private static func collectCellSpans(_ tc: XMLNode, styleInfo: StyleInfo, relationships: Relationships, notes: NoteNumbering) -> [Span] {
+    private static func collectCellSpans(_ tc: XMLNode, styleInfo: StyleInfo, relationships: Relationships, notes: NoteNumbering, comments: CommentRangeTracking) -> [Span] {
         var spans: [Span] = []
         for child in tc.children {
             switch child.name {
             case "w:p":
-                spans.append(contentsOf: collectSpans(in: child, styleInfo: styleInfo, relationships: relationships, notes: notes))
+                spans.append(contentsOf: collectSpans(in: child, styleInfo: styleInfo, relationships: relationships, notes: notes, comments: comments))
             case "w:tbl":
-                spans.append(contentsOf: flattenNestedTable(child, styleInfo: styleInfo, relationships: relationships, notes: notes))
+                spans.append(contentsOf: flattenNestedTable(child, styleInfo: styleInfo, relationships: relationships, notes: notes, comments: comments))
             case "w:sdt":
                 if let content = child.child("w:sdtContent") {
-                    spans.append(contentsOf: collectCellSpans(content, styleInfo: styleInfo, relationships: relationships, notes: notes))
+                    spans.append(contentsOf: collectCellSpans(content, styleInfo: styleInfo, relationships: relationships, notes: notes, comments: comments))
                 }
             default:
                 continue
@@ -2186,12 +2287,12 @@ enum DocxReader: OfficeDocumentReader {
     /// `collectCellSpans`, so a table nested inside a nested table (and a content control inside
     /// THAT) also survives — no depth cap is enforced; real documents don't go more than one or
     /// two levels, per the research survey.
-    private static func flattenNestedTable(_ table: XMLNode, styleInfo: StyleInfo, relationships: Relationships, notes: NoteNumbering) -> [Span] {
+    private static func flattenNestedTable(_ table: XMLNode, styleInfo: StyleInfo, relationships: Relationships, notes: NoteNumbering, comments: CommentRangeTracking) -> [Span] {
         var spans: [Span] = []
         for row in table.children where row.name == "w:tr" {
             var rowHasContent = false
             for cell in row.children where cell.name == "w:tc" {
-                let cellSpans = collectCellSpans(cell, styleInfo: styleInfo, relationships: relationships, notes: notes)
+                let cellSpans = collectCellSpans(cell, styleInfo: styleInfo, relationships: relationships, notes: notes, comments: comments)
                 guard !cellSpans.isEmpty else { continue }
                 if rowHasContent { spans.append(Span(text: "\t")) }
                 spans.append(contentsOf: cellSpans)
@@ -2219,7 +2320,7 @@ enum DocxReader: OfficeDocumentReader {
     /// mistaken for one. Only elements known to carry NO renderable body text of their own are
     /// pruned: paragraph/run properties (formatting only), deleted-content wrappers, empty
     /// markers, and section properties.
-    private static func collectSpans(in node: XMLNode, styleInfo: StyleInfo, relationships: Relationships, notes: NoteNumbering) -> [Span] {
+    private static func collectSpans(in node: XMLNode, styleInfo: StyleInfo, relationships: Relationships, notes: NoteNumbering, comments: CommentRangeTracking) -> [Span] {
         // The paragraph's own style id, read off THIS node's `w:pPr` directly — every caller passes
         // the paragraph (`w:p`) itself as `node` (`parseParagraph`, `collectCellSpans`'s `w:p` case),
         // never a sub-element, so this is the same `w:pPr/w:pStyle` `parseParagraph` itself reads for
@@ -2241,12 +2342,20 @@ enum DocxReader: OfficeDocumentReader {
                 span.bookmarks += pendingBookmarks
                 pendingBookmarks = []
             }
-            guard span.bookmarks.isEmpty else { spans.append(span); return }
-            // A bookmarked span is also never EXTENDED by whatever comes right after it — merging
-            // trailing text into it would grow the bookmark's rendered span past its real target,
-            // the same boundary-smearing `Span.bookmarks`' doc comment warns against, just from the
-            // other direction.
-            if let last = spans.last, last.bookmarks.isEmpty, last.bold == span.bold, last.italic == span.italic,
+            // Every span emitted while a `w:commentRangeStart…w:commentRangeEnd` range is open
+            // carries that comment's id(s) — see `Span.commentIds`. A span can be inside more than
+            // one open range at once (overlapping/nested comments), so this APPENDS every currently
+            // active id rather than picking one.
+            if !comments.activeIds.isEmpty {
+                span.commentIds += comments.activeIds
+            }
+            guard span.bookmarks.isEmpty, span.commentIds.isEmpty else { spans.append(span); return }
+            // A bookmarked/commented span is also never EXTENDED by whatever comes right after it —
+            // merging trailing text into it would grow the marker's rendered span past its real
+            // target/range, the same boundary-smearing `Span.bookmarks`'/`Span.commentIds`' doc
+            // comments warn against, just from the other direction.
+            if let last = spans.last, last.bookmarks.isEmpty, last.commentIds.isEmpty,
+               last.bold == span.bold, last.italic == span.italic,
                last.underline == span.underline, last.underlineStyle == span.underlineStyle,
                last.caps == span.caps, last.smallCaps == span.smallCaps,
                last.code == span.code, last.link == span.link,
@@ -2276,8 +2385,7 @@ enum DocxReader: OfficeDocumentReader {
                 // record of "moved away" markers rather than relying on them being harmlessly
                 // empty.
                 case "w:pPr", "w:rPr", "w:del", "w:moveFrom", "w:moveFromRangeStart", "w:moveFromRangeEnd",
-                     "w:bookmarkEnd", "w:proofErr",
-                     "w:sectPr", "w:commentRangeStart", "w:commentRangeEnd", "w:commentReference":
+                     "w:bookmarkEnd", "w:proofErr", "w:sectPr":
                     continue
                 // A bookmark's name is the target an in-document link (`w:anchor`) jumps to — see
                 // `Span.bookmarks`/`hyperlinkTarget` below. `_GoBack` is Word's own auto-inserted
@@ -2287,6 +2395,21 @@ enum DocxReader: OfficeDocumentReader {
                     if let name = child.attributes["w:name"], name != "_GoBack" {
                         pendingBookmarks.append(name)
                     }
+                    continue
+                // Opens/closes a comment's RANGE — every span emitted while it's open is marked (see
+                // `appendMerging` above and `CommentRangeTracking`). Ranges can be nested/overlapping
+                // (two reviewers commenting on overlapping text), so this is push/remove, not a
+                // single active id.
+                case "w:commentRangeStart":
+                    if let id = child.attributes["w:id"] { comments.start(id) }
+                    continue
+                case "w:commentRangeEnd":
+                    if let id = child.attributes["w:id"] { comments.end(id) }
+                    continue
+                // The point marker where Word draws the comment balloon/icon — it carries no text of
+                // its own (the range that was just closed already marked the commented spans), so
+                // there is nothing further to attach here.
+                case "w:commentReference":
                     continue
                 // A display equation — `collectFormulaBlocks` (called separately, once per
                 // paragraph, from `parseParagraph`) already turns this into its OWN `.formula`

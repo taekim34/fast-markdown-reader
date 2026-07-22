@@ -329,9 +329,9 @@ final class OfficeDocumentTests: XCTestCase {
     /// throw rather than silently falling through to `DocxReader` (the exact shape of bug this
     /// whole file guards against, isolated to the one function responsible for the routing).
     func testDocumentTypesReadOfficeRoutesEachExtensionToItsOwnReaderAndRejectsUnhandledOnes() throws {
-        let docxBlocks = try DocumentTypes.readOffice(try ZipArchive(data: fixtureDocx()), extension: "docx")
+        let docxBlocks = try DocumentTypes.readOffice(try ZipArchive(data: fixtureDocx()), extension: "docx").blocks
         XCTAssertFalse(docxBlocks.isEmpty)
-        let odtBlocks = try DocumentTypes.readOffice(try ZipArchive(data: fixtureOdt()), extension: "odt")
+        let odtBlocks = try DocumentTypes.readOffice(try ZipArchive(data: fixtureOdt()), extension: "odt").blocks
         XCTAssertFalse(odtBlocks.isEmpty)
         XCTAssertThrowsError(try DocumentTypes.readOffice(try ZipArchive(data: fixtureDocx()), extension: "rtf"))
     }
@@ -509,7 +509,7 @@ final class OfficeDocumentTests: XCTestCase {
         try doc.read(from: data, ofType: "org.openxmlformats.wordprocessingml.document")
         XCTAssertEqual(doc.officeDefaultBodyFontSize, 10)
 
-        guard case .office(_, _, let reloadedDefault) =
+        guard case .office(_, _, _, let reloadedDefault) =
             MarkdownDocument.reloadOutcome(url: url, kind: .office, extension: "docx")
         else { return XCTFail("expected a successful office reload") }
         XCTAssertEqual(reloadedDefault, doc.officeDefaultBodyFontSize,
@@ -822,5 +822,177 @@ final class OfficeDocumentTests: XCTestCase {
         XCTAssertEqual(style.paragraphSpacing, 12)
         XCTAssertEqual(style.headIndent, 72)
         XCTAssertEqual(style.lineHeightMultiple, 1.5)
+    }
+
+    // MARK: Comments (P6a) — captured through the full read path (invariant 29), never through
+    // `DocxReader.read`/`OdtReader.read` called directly, the same reasoning this whole file exists
+    // for: a dispatch-level regression (comments wired for one format, not the other) would be
+    // invisible to `DocxReaderTests`/`OdtReaderTests` calling their own parser directly.
+
+    /// Two `word/comments.xml` entries, each with its own `w:commentRangeStart…w:commentRangeEnd`
+    /// pair in the body: both must reach `doc.officeComments` (author/text/number) AND the spans
+    /// INSIDE each range must carry that comment's id — text outside either range must carry none.
+    func testDocxCommentsAndRangesAreCapturedThroughTheFullReadPath() throws {
+        let document = """
+        <?xml version="1.0" encoding="UTF-8"?><w:document><w:body>
+          <w:p>
+            <w:r><w:t>Alpha </w:t></w:r>
+            <w:commentRangeStart w:id="0"/>
+            <w:r><w:t>bravo</w:t></w:r>
+            <w:commentRangeEnd w:id="0"/>
+            <w:r><w:commentReference w:id="0"/></w:r>
+            <w:r><w:t> charlie </w:t></w:r>
+            <w:commentRangeStart w:id="1"/>
+            <w:r><w:t>delta</w:t></w:r>
+            <w:commentRangeEnd w:id="1"/>
+            <w:r><w:commentReference w:id="1"/></w:r>
+          </w:p>
+        </w:body></w:document>
+        """
+        let comments = """
+        <?xml version="1.0" encoding="UTF-8"?><w:comments>
+          <w:comment w:id="0" w:author="Alice" w:date="2024-01-01T00:00:00Z"><w:p><w:r><w:t>First comment</w:t></w:r></w:p></w:comment>
+          <w:comment w:id="1" w:author="Bob" w:date="2024-01-02T00:00:00Z"><w:p><w:r><w:t>Second comment</w:t></w:r></w:p></w:comment>
+        </w:comments>
+        """
+        let zip = buildZip([
+            ("word/document.xml", Data(document.utf8)),
+            ("word/comments.xml", Data(comments.utf8)),
+        ])
+        let (doc, _) = try openOffice(zip)
+        XCTAssertEqual(doc.officeComments.count, 2)
+        XCTAssertEqual(doc.officeComments[0].author, "Alice")
+        XCTAssertEqual(doc.officeComments[0].text, "First comment")
+        XCTAssertEqual(doc.officeComments[0].dateISO, "2024-01-01T00:00:00Z")
+        XCTAssertEqual(doc.officeComments[0].number, 1)
+        XCTAssertEqual(doc.officeComments[1].author, "Bob")
+        XCTAssertEqual(doc.officeComments[1].text, "Second comment")
+        XCTAssertEqual(doc.officeComments[1].number, 2)
+
+        guard case .paragraph(let spans, _, _, _, _) = doc.officeBlocks.first else {
+            return XCTFail("expected a paragraph")
+        }
+        let alpha = try XCTUnwrap(spans.first { $0.text == "Alpha " })
+        XCTAssertTrue(alpha.commentIds.isEmpty)
+        let bravo = try XCTUnwrap(spans.first { $0.text == "bravo" })
+        XCTAssertEqual(bravo.commentIds, ["0"])
+        let delta = try XCTUnwrap(spans.first { $0.text == "delta" })
+        XCTAssertEqual(delta.commentIds, ["1"])
+    }
+
+    /// A comment in `word/comments.xml` with no matching `w:commentRangeStart`/`w:commentReference`
+    /// anywhere in the body — still listed (with a display number), but no span anchors it.
+    func testDocxCommentWithNoBodyRangeIsListedButAnchorsNothing() throws {
+        let document = """
+        <?xml version="1.0" encoding="UTF-8"?><w:document><w:body>
+          <w:p><w:r><w:t>Plain text, no ranges at all.</w:t></w:r></w:p>
+        </w:body></w:document>
+        """
+        let comments = """
+        <?xml version="1.0" encoding="UTF-8"?><w:comments>
+          <w:comment w:id="5" w:author="Carol"><w:p><w:r><w:t>Orphan comment</w:t></w:r></w:p></w:comment>
+        </w:comments>
+        """
+        let zip = buildZip([
+            ("word/document.xml", Data(document.utf8)),
+            ("word/comments.xml", Data(comments.utf8)),
+        ])
+        let (doc, _) = try openOffice(zip)
+        XCTAssertEqual(doc.officeComments.count, 1)
+        XCTAssertEqual(doc.officeComments[0].id, "5")
+        XCTAssertEqual(doc.officeComments[0].author, "Carol")
+        XCTAssertEqual(doc.officeComments[0].number, 1)
+        guard case .paragraph(let spans, _, _, _, _) = doc.officeBlocks.first else {
+            return XCTFail("expected a paragraph")
+        }
+        XCTAssertTrue(spans.allSatisfy { $0.commentIds.isEmpty })
+    }
+
+    /// A docx with no comments at all — `officeComments` is empty and no span carries an id. Every
+    /// comment marker was already SKIPPED before P6a (invariant: this sprint only starts capturing
+    /// them, never invents one), so this is the render-stays-byte-identical guarantee.
+    func testDocxWithNoCommentsProducesEmptyOfficeCommentsAndNoSpanCarriesAnId() throws {
+        let (doc, _) = try openOffice(fixtureDocx())
+        XCTAssertTrue(doc.officeComments.isEmpty)
+        for block in doc.officeBlocks {
+            switch block {
+            case .paragraph(let spans, _, _, _, _), .heading(_, let spans, _, _, _, _),
+                 .listItem(_, _, let spans, _, _, _, _, _):
+                XCTAssertTrue(spans.allSatisfy { $0.commentIds.isEmpty })
+            case .table, .image, .unsupportedGraphic, .formula:
+                continue
+            }
+        }
+    }
+
+    /// ODT's `office:annotation` is inline, RANGED by a shared `office:name` matched to a later
+    /// `office:annotation-end` — the span(s) between the two carry the comment's id, text outside
+    /// the range carries none.
+    func testOdtAnnotationRangeIsCapturedThroughTheFullReadPath() throws {
+        let content = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <office:document-content>
+          <office:body><office:text>
+            <text:p>Before <office:annotation office:name="c1"><dc:creator>Dana</dc:creator><dc:date>2024-02-02T00:00:00Z</dc:date><text:p>Odt comment text</text:p></office:annotation>commented<office:annotation-end office:name="c1"/> after</text:p>
+          </office:text></office:body>
+        </office:document-content>
+        """
+        let zip = buildZip([("content.xml", Data(content.utf8))])
+        let (doc, _) = try openOffice(zip, ext: "odt", uti: "org.oasis-open.opendocument.text")
+        XCTAssertEqual(doc.officeComments.count, 1)
+        XCTAssertEqual(doc.officeComments[0].id, "c1")
+        XCTAssertEqual(doc.officeComments[0].author, "Dana")
+        XCTAssertEqual(doc.officeComments[0].dateISO, "2024-02-02T00:00:00Z")
+        XCTAssertEqual(doc.officeComments[0].text, "Odt comment text")
+        XCTAssertEqual(doc.officeComments[0].number, 1)
+
+        guard case .paragraph(let spans, _, _, _, _) = doc.officeBlocks.first else {
+            return XCTFail("expected a paragraph")
+        }
+        let before = try XCTUnwrap(spans.first { $0.text == "Before " })
+        XCTAssertTrue(before.commentIds.isEmpty)
+        let commented = try XCTUnwrap(spans.first { $0.text == "commented" })
+        XCTAssertEqual(commented.commentIds, ["c1"])
+        let after = try XCTUnwrap(spans.first { $0.text == " after" })
+        XCTAssertTrue(after.commentIds.isEmpty)
+    }
+
+    /// A POINT `office:annotation` — no `office:name`, so no `office:annotation-end` can ever match
+    /// it — is still captured and listed (with a display number), but deliberately anchors nothing
+    /// (see the `office:annotation` case in `OdtReader.collectSpans`'s own doc for why).
+    func testOdtPointAnnotationWithNoNameIsListedButAnchorsNothing() throws {
+        let content = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <office:document-content>
+          <office:body><office:text>
+            <text:p>Point comment here<office:annotation><dc:creator>Eve</dc:creator><text:p>Point note</text:p></office:annotation> after</text:p>
+          </office:text></office:body>
+        </office:document-content>
+        """
+        let zip = buildZip([("content.xml", Data(content.utf8))])
+        let (doc, _) = try openOffice(zip, ext: "odt", uti: "org.oasis-open.opendocument.text")
+        XCTAssertEqual(doc.officeComments.count, 1)
+        XCTAssertEqual(doc.officeComments[0].author, "Eve")
+        XCTAssertEqual(doc.officeComments[0].text, "Point note")
+        guard case .paragraph(let spans, _, _, _, _) = doc.officeBlocks.first else {
+            return XCTFail("expected a paragraph")
+        }
+        XCTAssertTrue(spans.allSatisfy { $0.commentIds.isEmpty })
+    }
+
+    /// An `.odt` with no comments at all — `officeComments` is empty and no span carries an id,
+    /// mirroring the docx no-comments guarantee above.
+    func testOdtWithNoCommentsProducesEmptyOfficeCommentsAndNoSpanCarriesAnId() throws {
+        let (doc, _) = try openOffice(fixtureOdt(), ext: "odt", uti: "org.oasis-open.opendocument.text")
+        XCTAssertTrue(doc.officeComments.isEmpty)
+        for block in doc.officeBlocks {
+            switch block {
+            case .paragraph(let spans, _, _, _, _), .heading(_, let spans, _, _, _, _),
+                 .listItem(_, _, let spans, _, _, _, _, _):
+                XCTAssertTrue(spans.allSatisfy { $0.commentIds.isEmpty })
+            case .table, .image, .unsupportedGraphic, .formula:
+                continue
+            }
+        }
     }
 }

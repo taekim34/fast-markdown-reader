@@ -21,7 +21,7 @@ final class DocxReaderTests: XCTestCase {
     /// at all omits the `.rels` part too — several tests below exercise both).
     private func buildDocx(
         document: String, styles: String? = nil, numbering: String? = nil, rels: String? = nil,
-        footnotes: String? = nil, endnotes: String? = nil, theme: String? = nil,
+        footnotes: String? = nil, endnotes: String? = nil, theme: String? = nil, comments: String? = nil,
         media: [(name: String, bytes: [UInt8])] = []
     ) -> Data {
         var entries: [(String, Data)] = [("word/document.xml", Data(document.utf8))]
@@ -31,6 +31,7 @@ final class DocxReaderTests: XCTestCase {
         if let footnotes { entries.append(("word/footnotes.xml", Data(footnotes.utf8))) }
         if let endnotes { entries.append(("word/endnotes.xml", Data(endnotes.utf8))) }
         if let theme { entries.append(("word/theme/theme1.xml", Data(theme.utf8))) }
+        if let comments { entries.append(("word/comments.xml", Data(comments.utf8))) }
         for (name, bytes) in media { entries.append(("word/media/" + name, Data(bytes))) }
         return buildZip(entries)
     }
@@ -121,19 +122,19 @@ final class DocxReaderTests: XCTestCase {
     ) throws -> [OfficeBlock] {
         let zip = buildDocx(document: doc(document), styles: styles, numbering: numbering, footnotes: footnotes, endnotes: endnotes)
         let archive = try ZipArchive(data: zip)
-        return try DocxReader.read(archive)
+        return try DocxReader.read(archive).blocks
     }
 
     private func read(document: String, rels: String?, media: [(name: String, bytes: [UInt8])] = []) throws -> [OfficeBlock] {
         let zip = buildDocx(document: doc(document), rels: rels, media: media)
         let archive = try ZipArchive(data: zip)
-        return try DocxReader.read(archive)
+        return try DocxReader.read(archive).blocks
     }
 
     private func read(document: String, styles: String?, theme: String?) throws -> [OfficeBlock] {
         let zip = buildDocx(document: doc(document), styles: styles, theme: theme)
         let archive = try ZipArchive(data: zip)
-        return try DocxReader.read(archive)
+        return try DocxReader.read(archive).blocks
     }
 
     /// A bare 6-digit hex → `NSColor`, matching `DocxReader.colorFromHex`'s own reading — used by
@@ -948,7 +949,7 @@ final class DocxReaderTests: XCTestCase {
         let zip = buildDocx(
             document: doc("<w:tbl><w:tr>\(tc("<w:p><w:r>\(drawing(cx: 914_400, cy: 457_200, embed: "rId1"))</w:r></w:p>"))</w:tr></w:tbl>"),
             rels: rels([(id: "rId1", target: "media/image1.png", external: false)]))
-        let blocks = try DocxReader.read(try ZipArchive(data: zip))
+        let blocks = try DocxReader.read(try ZipArchive(data: zip)).blocks
         XCTAssertEqual(blocks, [.table(rows: [
             [Cell(blocks: [.image(id: "word/media/image1.png", size: CGSize(width: 72, height: 36))])],
         ], headerRows: 0)])
@@ -991,7 +992,7 @@ final class DocxReaderTests: XCTestCase {
         let zip = buildDocx(
             document: doc("<w:tbl><w:tr>\(tc(cellXML))</w:tr></w:tbl>"), numbering: flatDecimalNumbering,
             rels: rels([(id: "rId1", target: "media/image1.png", external: false)]))
-        let blocks = try DocxReader.read(try ZipArchive(data: zip))
+        let blocks = try DocxReader.read(try ZipArchive(data: zip)).blocks
         XCTAssertEqual(blocks, [.table(rows: [
             [Cell(blocks: [
                 .paragraph(spans: [Span(text: "Intro")]),
@@ -1012,7 +1013,7 @@ final class DocxReaderTests: XCTestCase {
         </w:tbl>
         """
         let zip = buildDocx(document: doc(document), rels: rels([(id: "rId1", target: "media/image1.png", external: false)]))
-        let blocks = try DocxReader.read(try ZipArchive(data: zip))
+        let blocks = try DocxReader.read(try ZipArchive(data: zip)).blocks
         XCTAssertEqual(blocks, [.table(rows: [
             [Cell(spans: [Span(text: "Top")], rowSpan: 2)],
             [],
@@ -1055,7 +1056,7 @@ final class DocxReaderTests: XCTestCase {
             document: doc("<w:p><w:hyperlink r:id=\"rId5\"><w:r><w:t>click here</w:t></w:r></w:hyperlink></w:p>"),
             rels: rels([(id: "rId5", target: "https://example.com/", external: true)]))
         let archive = try ZipArchive(data: zip)
-        let blocks = try DocxReader.read(archive)
+        let blocks = try DocxReader.read(archive).blocks
         XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "click here", link: "https://example.com/")])])
     }
 
@@ -1091,7 +1092,7 @@ final class DocxReaderTests: XCTestCase {
             """),
             rels: rels([(id: "rId5", target: "https://example.com/", external: true)]))
         let archive = try ZipArchive(data: zip)
-        let blocks = try DocxReader.read(archive)
+        let blocks = try DocxReader.read(archive).blocks
         XCTAssertEqual(blocks, [.paragraph(spans: [
             Span(text: "See "),
             Span(text: "this page", link: "https://example.com/"),
@@ -1843,7 +1844,7 @@ final class DocxReaderTests: XCTestCase {
         """)
         let zip = buildDocx(document: document, rels: rels([(id: "rIdFallback", target: "media/chart1.png", external: false)]))
         let archive = try ZipArchive(data: zip)
-        let blocks = try DocumentTypes.readOffice(archive, extension: "docx")
+        let blocks = try DocumentTypes.readOffice(archive, extension: "docx").blocks
         XCTAssertEqual(blocks, [.image(id: "word/media/chart1.png", size: CGSize(width: 100, height: 50))])
     }
 
@@ -2802,7 +2803,7 @@ final class DocxReaderTests: XCTestCase {
         let document = doc("<w:p><w:r><w:rPr><w:color w:themeColor=\"accent1\"/></w:rPr><w:t>Theme</w:t></w:r></w:p>")
         let zip = buildDocx(document: document, theme: sampleTheme)
         let archive = try ZipArchive(data: zip)
-        let blocks = try DocumentTypes.readOffice(archive, extension: "docx")
+        let blocks = try DocumentTypes.readOffice(archive, extension: "docx").blocks
         XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Theme", textColor: rgb("4F81BD"))])])
     }
 

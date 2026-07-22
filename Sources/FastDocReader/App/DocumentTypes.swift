@@ -8,7 +8,7 @@ import CoreGraphics
 /// (`officeDefaultBodyFontSize`) without a second switch that could name a different reader for the
 /// same extension (see `officeReaderType`'s own doc for why that divergence is the thing to avoid).
 protocol OfficeDocumentReader {
-    static func read(_ archive: ZipArchive) throws -> [OfficeBlock]
+    static func read(_ archive: ZipArchive) throws -> OfficeReadResult
     static func documentDefaultBodyFontSize(_ archive: ZipArchive) -> CGFloat
 }
 
@@ -63,7 +63,7 @@ enum DocumentTypes {
         }
     }
 
-    static func readOffice(_ archive: ZipArchive, extension ext: String) throws -> [OfficeBlock] {
+    static func readOffice(_ archive: ZipArchive, extension ext: String) throws -> OfficeReadResult {
         guard let reader = officeReaderType(for: ext) else {
             throw NSError(domain: "ai.ww-w.fast-md-reader", code: 3, userInfo: [
                 NSLocalizedDescriptionKey: "\".\(ext)\" is registered as an office format but has no reader.",

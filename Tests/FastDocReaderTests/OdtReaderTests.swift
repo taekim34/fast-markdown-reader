@@ -86,7 +86,7 @@ final class OdtReaderTests: XCTestCase {
     private func read(body: String, automaticStyles: String = "", styles: String? = nil) throws -> [OfficeBlock] {
         let zip = buildOdt(content: doc(body: body, automaticStyles: automaticStyles), styles: styles)
         let archive = try ZipArchive(data: zip)
-        return try OdtReader.read(archive)
+        return try OdtReader.read(archive).blocks
     }
 
     /// Matches `OdtReader.parseODFColor`'s own construction (`deviceRed:`, not `srgbRed:`) so a
@@ -102,7 +102,7 @@ final class OdtReaderTests: XCTestCase {
         var entries: [(String, Data)] = [("content.xml", Data(doc(body: body).utf8))]
         for (name, bytes) in media { entries.append((name, Data(bytes))) }
         let archive = try ZipArchive(data: buildZip(entries))
-        return try OdtReader.read(archive)
+        return try OdtReader.read(archive).blocks
     }
 
     // MARK: Headings
@@ -463,7 +463,7 @@ final class OdtReaderTests: XCTestCase {
             """).utf8)),
             ("Pictures/photo.png", Data([0x01])),
         ])
-        let blocks = try OdtReader.read(try ZipArchive(data: zip))
+        let blocks = try OdtReader.read(try ZipArchive(data: zip)).blocks
         XCTAssertEqual(blocks, [.table(rows: [
             [Cell(blocks: [.image(id: "Pictures/photo.png", size: CGSize(width: 72, height: 36))])],
         ], headerRows: 0)])
@@ -511,7 +511,7 @@ final class OdtReaderTests: XCTestCase {
             ).utf8)),
             ("Pictures/photo.png", Data([0x01])),
         ])
-        let blocks = try OdtReader.read(try ZipArchive(data: zip))
+        let blocks = try OdtReader.read(try ZipArchive(data: zip)).blocks
         XCTAssertEqual(blocks, [.table(rows: [
             [Cell(blocks: [
                 .paragraph(spans: [Span(text: "Intro")]),
@@ -1083,7 +1083,7 @@ final class OdtReaderTests: XCTestCase {
             """,
             automaticStyles: numberThenBulletListStyle))
         let archive = try ZipArchive(data: zip)
-        let blocks = try DocumentTypes.readOffice(archive, extension: "odt")
+        let blocks = try DocumentTypes.readOffice(archive, extension: "odt").blocks
         let allText = blocks.flatMap { block -> [String] in
             switch block {
             case .paragraph(let spans, _, _, _, _), .heading(_, let spans, _, _, _, _), .listItem(_, _, let spans, _, _, _, _, _): return spans.map(\.text)
@@ -1471,7 +1471,7 @@ final class OdtReaderTests: XCTestCase {
             <style:style style:name="Centered" style:family="paragraph"><style:paragraph-properties fo:text-align="center"/></style:style>
             """))
         let archive = try ZipArchive(data: zip)
-        let blocks = try DocumentTypes.readOffice(archive, extension: "odt")
+        let blocks = try DocumentTypes.readOffice(archive, extension: "odt").blocks
         guard case .table(let rows, _, _, _) = blocks.first, let cell = rows.first?.first else {
             return XCTFail("expected a table with a cell")
         }

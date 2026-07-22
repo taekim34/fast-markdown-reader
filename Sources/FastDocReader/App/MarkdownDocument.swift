@@ -10,6 +10,12 @@ final class MarkdownDocument: NSDocument {
     /// Empty for every other kind.
     private(set) var officeBlocks: [OfficeBlock] = []
 
+    /// Every reviewer comment the source document declares (`word/comments.xml`, inline
+    /// `office:annotation`) — see `OfficeComment`. Set alongside `officeBlocks` on every read/reload
+    /// (see `setOfficeContent`); empty for every non-office kind, and for an office document with no
+    /// comments. P6a captures this ONLY — no view reads it yet (the sidebar panel is P6b).
+    private(set) var officeComments: [OfficeComment] = []
+
     /// The SOURCE document's own default body run size, in points — see
     /// `OfficeTextBuilder.build`'s `documentDefaultFontSize` doc for the font-size model this
     /// feeds. Set from `DocumentTypes.officeDefaultBodyFontSize`, both on first `read(from:)` and on
@@ -92,8 +98,9 @@ final class MarkdownDocument: NSDocument {
         }
         let archive = try ZipArchive(data: data)
         let ext = fileURL?.pathExtension ?? untitledExtension ?? ""
+        let result = try DocumentTypes.readOffice(archive, extension: ext)
         setOfficeContent(
-            blocks: try DocumentTypes.readOffice(archive, extension: ext), archive: archive,
+            blocks: result.blocks, comments: result.comments, archive: archive,
             defaultBodyFontSize: DocumentTypes.officeDefaultBodyFontSize(archive, extension: ext))
     }
 
@@ -102,8 +109,11 @@ final class MarkdownDocument: NSDocument {
     /// block's id to bytes. Not `private` — `OfficeDocumentTests` drives image loading against
     /// synthetic blocks/archives it builds itself, independent of whatever `DocxReader` parses (that
     /// parser's own correctness is `DocxReaderTests`' job, not this file's).
-    func setOfficeContent(blocks: [OfficeBlock], archive: ZipArchive, defaultBodyFontSize: CGFloat = 11) {
+    func setOfficeContent(
+        blocks: [OfficeBlock], comments: [OfficeComment] = [], archive: ZipArchive, defaultBodyFontSize: CGFloat = 11
+    ) {
         self.officeBlocks = blocks
+        self.officeComments = comments
         self.officeArchive = archive
         self.officeDefaultBodyFontSize = defaultBodyFontSize
         self.text = ""
@@ -133,7 +143,7 @@ final class MarkdownDocument: NSDocument {
     /// failing meant the function silently did nothing, which looks identical to a successful no-op
     /// reload and hides a real problem (deleted file, permissions, a corrupted archive) from the user.
     enum ReloadOutcome {
-        case office(blocks: [OfficeBlock], archive: ZipArchive, defaultBodyFontSize: CGFloat)
+        case office(blocks: [OfficeBlock], comments: [OfficeComment], archive: ZipArchive, defaultBodyFontSize: CGFloat)
         case text(TextFile)
         case failure(String)
     }
@@ -155,9 +165,11 @@ final class MarkdownDocument: NSDocument {
         }
         do {
             let archive = try ZipArchive(data: data)
-            let blocks = try DocumentTypes.readOffice(archive, extension: ext)
+            let result = try DocumentTypes.readOffice(archive, extension: ext)
             let defaultBodyFontSize = DocumentTypes.officeDefaultBodyFontSize(archive, extension: ext)
-            return .office(blocks: blocks, archive: archive, defaultBodyFontSize: defaultBodyFontSize)
+            return .office(
+                blocks: result.blocks, comments: result.comments, archive: archive,
+                defaultBodyFontSize: defaultBodyFontSize)
         } catch {
             return .failure(error.localizedDescription)
         }
@@ -181,13 +193,13 @@ final class MarkdownDocument: NSDocument {
         if let url = fileURL {
             let ext = url.pathExtension.isEmpty ? (untitledExtension ?? "") : url.pathExtension
             switch Self.reloadOutcome(url: url, kind: kind, extension: ext) {
-            case .office(let blocks, let archive, let defaultBodyFontSize):
+            case .office(let blocks, let comments, let archive, let defaultBodyFontSize):
                 // Re-parse the archive, same as the initial read — never through the text-decode
                 // path (invariant: an office document's bytes are never handed to
                 // `TextEncodingDetector`). `defaultBodyFontSize` is carried through too, so a
                 // reload renders identically to the first open of the same file (see invariant 29's
                 // "reload must behave the same as first open" lesson).
-                setOfficeContent(blocks: blocks, archive: archive, defaultBodyFontSize: defaultBodyFontSize)
+                setOfficeContent(blocks: blocks, comments: comments, archive: archive, defaultBodyFontSize: defaultBodyFontSize)
             case .text(let reread):
                 // The undo stack holds source OFFSETS into the text we're replacing. Re-reading the
                 // file can move every one of them (the file may have changed behind us), so an undo

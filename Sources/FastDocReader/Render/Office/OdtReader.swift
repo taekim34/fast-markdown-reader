@@ -31,7 +31,7 @@ enum OdtReader: OfficeDocumentReader {
     /// This reader emits `.image` blocks — PARSING only. Resolving an emitted id to actual pixels
     /// (reading the archive entry, drawing a placeholder for an unresolvable one) is a later
     /// sprint's job, exactly as in `DocxReader`.
-    static func read(_ archive: ZipArchive) throws -> [OfficeBlock] {
+    static func read(_ archive: ZipArchive) throws -> OfficeReadResult {
         guard archive.contains("content.xml") else { throw ReadError.missingContentXML }
         guard let contentRoot = try? buildTree(archive.data(for: "content.xml")) else {
             throw ReadError.malformedXML("content.xml")
@@ -77,7 +77,7 @@ enum OdtReader: OfficeDocumentReader {
         let styles = ParsedStyles(
             listStyles: listStyles, textStyles: textStyles, paragraphStyles: paragraphStyles,
             tableCellStyles: tableCellStyles, tableColumnStyles: tableColumnStyles)
-        guard let body = contentRoot.firstDescendant("office:text") else { return [] }
+        guard let body = contentRoot.firstDescendant("office:text") else { return OfficeReadResult(blocks: []) }
         // ODF footnotes AND endnotes are the SAME element (`text:note`, told apart only by
         // `text:note-class`), sitting INLINE at the citation point with the note's own marker
         // (`text:note-citation`) and full body (`text:note-body`) as children of that one element —
@@ -91,7 +91,9 @@ enum OdtReader: OfficeDocumentReader {
         let notes = NoteCollector()
         let bodyBlocks = parseBody(body, styles: styles, archive: archive, notes: notes)
         let noteBlocks = buildNoteBlocks(notes.entries, styles: styles, archive: archive)
-        return bodyBlocks + noteBlocks
+        return OfficeReadResult(
+            blocks: bodyBlocks + noteBlocks,
+            comments: notes.comments.sorted { $0.number < $1.number })
     }
 
     /// The document's own default BODY paragraph size, in points — ODF states this in
@@ -134,6 +136,40 @@ enum OdtReader: OfficeDocumentReader {
     private final class NoteCollector {
         var fallbackCounter = 1
         var entries: [(marker: String, body: XMLNode)] = []
+        /// P6a — reviewer comments (`office:annotation`), captured on the SAME class as footnotes
+        /// for the same reason: `collectSpans` and its callers already thread `NoteCollector`
+        /// through every layer (paragraphs, list items, table cells) purely to mutate shared state,
+        /// so comment tracking rides that existing thread rather than adding a second parameter to
+        /// every one of those functions. `activeCommentIds` is the RANGE tracker (open between an
+        /// `office:annotation` that declares `office:name` and the matching `office:annotation-end`
+        /// — see the `office:annotation`/`office:annotation-end` cases in `collectSpans`'s walk);
+        /// `comments` accumulates every `OfficeComment` found, `commentNumberCounter` assigns each
+        /// its 1-based first-appearance-in-body display number.
+        var activeCommentIds: [String] = []
+        var comments: [OfficeComment] = []
+        var commentNumberCounter = 1
+    }
+
+    /// Every `#text` descendant of `node`, concatenated in document order, with `text:tab`/
+    /// `text:line-break` turned into `\t`/`\n` — used ONLY for a comment's own `dc:creator`/
+    /// `dc:date`/`text:p` content (P6a — `OfficeComment` carries no `Span`s, unlike a document
+    /// paragraph, so there is nothing to preserve formatting FOR here, unlike `collectSpans`'s own
+    /// walk). Not `collectSpans` itself: that produces styled `Span`s and threads bookmarks/
+    /// comment-range state neither of which a comment's own text needs.
+    private static func plainText(of node: XMLNode) -> String {
+        var text = ""
+        func walk(_ node: XMLNode) {
+            for child in node.children {
+                switch child.name {
+                case "#text": text += child.text
+                case "text:tab": text += "\t"
+                case "text:line-break": text += "\n"
+                default: walk(child)
+                }
+            }
+        }
+        walk(node)
+        return text
     }
 
     /// `text:note-citation`'s own character-data children ARE the marker Word/LibreOffice actually
@@ -850,7 +886,13 @@ enum OdtReader: OfficeDocumentReader {
                  "text:user-field-decls", "office:forms", "office:scripts":
                 // Deliberate exclusions — dropped ON PURPOSE, not by omission (see the permissive
                 // `default` below):
-                //  - `office:annotation`: review comments — out of scope by design, no comment UI.
+                //  - `office:annotation`: a comment standing directly under `office:text` rather
+                //    than inline inside a `text:p` — not the shape a real ODF producer writes (an
+                //    annotation is paragraph-content per the OASIS schema), so this is a malformed-
+                //    document guard, not the normal path. Real comments ARE captured — see the
+                //    `office:annotation`/`office:annotation-end` cases in `collectSpans`'s inline
+                //    walk (P6a) — this exclusion only drops the shape that has no enclosing
+                //    paragraph for a comment's spans to anchor into.
                 //  - `text:tracked-changes`: the DELETED-content stash. A deletion is a single,
                 //    empty `<text:change/>` point marker inline (walked as a no-op by
                 //    `collectSpans`'s permissive default), while its actual payload lives in a
@@ -1374,21 +1416,26 @@ enum OdtReader: OfficeDocumentReader {
                 bookmarks = pendingBookmarks
                 pendingBookmarks = []
             }
-            guard bookmarks.isEmpty else {
+            // Every span emitted while a NAMED `office:annotation` range is open carries that
+            // comment's id — see `Span.commentIds` and the `office:annotation`/
+            // `office:annotation-end` cases below.
+            let commentIds = notes.activeCommentIds
+            guard bookmarks.isEmpty, commentIds.isEmpty else {
                 spans.append(Span(
                     text: text, bold: style.bold, italic: style.italic, underline: style.underline,
                     underlineStyle: style.underlineStyle, caps: style.caps, smallCaps: style.smallCaps, link: link,
                     strikethrough: style.strikethrough, superscript: style.superscript, subscripted: style.subscripted,
-                    bookmarks: bookmarks, textColor: style.textColor, highlightColor: style.highlightColor,
+                    bookmarks: bookmarks, commentIds: commentIds, textColor: style.textColor, highlightColor: style.highlightColor,
                     fontSize: style.fontSize, fontName: style.fontName))
                 return
             }
-            // A bookmarked span is never EXTENDED by trailing text either — see the matching guard
-            // in `DocxReader.collectSpans`. `textColor`/`highlightColor`/`fontSize`/`fontName`/
-            // `underlineStyle`/`caps`/`smallCaps` (P3/P4's own additions) join the same equality
-            // check — two runs that only differ in, say, colour must stay two separate `Span`s, or
-            // the second run's colour would silently win for the whole merged range.
-            if let last = spans.last, last.bookmarks.isEmpty, last.bold == style.bold, last.italic == style.italic, last.underline == style.underline,
+            // A bookmarked/commented span is never EXTENDED by trailing text either — see the
+            // matching guard in `DocxReader.collectSpans`. `textColor`/`highlightColor`/`fontSize`/
+            // `fontName`/`underlineStyle`/`caps`/`smallCaps` (P3/P4's own additions) join the same
+            // equality check — two runs that only differ in, say, colour must stay two separate
+            // `Span`s, or the second run's colour would silently win for the whole merged range.
+            if let last = spans.last, last.bookmarks.isEmpty, last.commentIds.isEmpty,
+               last.bold == style.bold, last.italic == style.italic, last.underline == style.underline,
                last.strikethrough == style.strikethrough, last.superscript == style.superscript,
                last.subscripted == style.subscripted, last.link == link, last.textColor == style.textColor,
                last.highlightColor == style.highlightColor, last.fontSize == style.fontSize, last.fontName == style.fontName,
@@ -1487,9 +1534,37 @@ enum OdtReader: OfficeDocumentReader {
                     // never rendered as text — see `Span.bookmarks`.
                     if let name = child.attributes["text:name"] { pendingBookmarks.append(name) }
                     continue
-                case "text:bookmark-end", "office:annotation",
-                     "office:annotation-end", "text:soft-page-break":
+                case "text:bookmark-end", "text:soft-page-break":
                     continue // markers with no renderable text of their own
+                // A reviewer comment (P6a — see `OfficeComment`). ODF puts it INLINE, mixed into
+                // the paragraph's own run content: `dc:creator`/`dc:date` (author/timestamp) plus
+                // `text:p` children (the comment's own text). `office:name`, when present, is what
+                // pairs this start with a LATER `office:annotation-end` of the same name, marking a
+                // RANGE — every span in between carries this comment's id (see `appendMerging`
+                // above). An annotation with NO `office:name` is a POINT comment (LibreOffice's
+                // common case for "comment on the cursor, no selection") — it is captured and
+                // listed (still gets a display number), but this reader has no way to know how far
+                // its "range" should extend without a name to match a later end against, so it
+                // deliberately anchors NOTHING rather than guessing (never opened as active).
+                case "office:annotation":
+                    let author = child.child("dc:creator").map(plainText(of:)).flatMap { $0.isEmpty ? nil : $0 }
+                    let dateISO = child.child("dc:date").map(plainText(of:)).flatMap { $0.isEmpty ? nil : $0 }
+                    let text = child.children.filter { $0.name == "text:p" }
+                        .map(plainText(of:))
+                        .joined(separator: "\n")
+                    let name = child.attributes["office:name"]
+                    let id = name ?? "odt-comment-\(notes.commentNumberCounter)"
+                    let comment = OfficeComment(
+                        id: id, author: author, dateISO: dateISO, text: text, number: notes.commentNumberCounter)
+                    notes.commentNumberCounter += 1
+                    notes.comments.append(comment)
+                    if let name { notes.activeCommentIds.append(name) }
+                    continue
+                case "office:annotation-end":
+                    if let name = child.attributes["office:name"] {
+                        notes.activeCommentIds.removeAll { $0 == name }
+                    }
+                    continue
                 default:
                     // Anything else this switch doesn't specifically name is descended into rather
                     // than skipped, so text is never lost just because ODF wrapped it in something

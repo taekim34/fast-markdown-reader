@@ -54,6 +54,15 @@ struct Span: Equatable {
     /// its neighbour (see both readers' `appendMerging`) — merging would smear the marker's exact
     /// position across text that predates the bookmark.
     var bookmarks: [String] = []
+    /// The id(s) of the reviewer COMMENT(s) whose commented RANGE this span falls within (docx
+    /// `w:commentRangeStart`/`w:commentRangeEnd` @w:id, odt `office:annotation`/
+    /// `office:annotation-end` @office:name) — empty for ordinary text, matching `OfficeComment.id`.
+    /// A span can carry more than one id when two comments' ranges overlap — always APPENDED, never
+    /// replaced. A span carrying a comment id is never merged into its neighbour (see both readers'
+    /// `appendMerging`), the same reasoning as `bookmarks` above: merging would smear the range's
+    /// exact extent across text that predates or postdates it. This sprint (P6a) only CAPTURES this
+    /// — no view draws a highlight or a sidebar from it yet (P6b).
+    var commentIds: [String] = []
     /// The run's authored text colour, already resolved to a literal RGB — `nil` means the source
     /// didn't specify one (or, for a THEME colour reference such as docx `w:color/@themeColor`,
     /// that a reader hasn't resolved it to a literal value yet; resolving those references against
@@ -448,4 +457,37 @@ enum OfficeBlock: Equatable {
     /// empty: an equation with no translatable content at all is degraded, before construction, to
     /// a visible text block by the reader — this case never carries "nothing to render".
     case formula(latex: String)
+}
+
+/// One reviewer comment (docx `word/comments.xml` `w:comment`, odt inline `office:annotation`) —
+/// content and identity ONLY; where it anchors is on the `Span`s that carry its `id` in their own
+/// `commentIds` (see that field's doc), not here. `id` is the source's own key (docx `@w:id`, odt
+/// `@office:name` or a reader-synthesized id when the source gave none — see each reader) — opaque,
+/// only used to match back to `Span.commentIds`. `author`/`dateISO` are `nil` when the source didn't
+/// say (a comment with no name-tagged reviewer, or a producer that omits the timestamp); `dateISO`
+/// is carried VERBATIM as the source wrote it (docx `@w:date` is already ISO-8601; odt `dc:date` the
+/// same), never reformatted — this project has no comment-panel UI yet (P6b) to decide a display
+/// format for. `number` is the comment's 1-based DISPLAY order — by first appearance of its anchor
+/// in the body when it has one, or (for a comment the body never anchors at all) continuing that
+/// same sequence in the source's own file order — so a reader can show "Comment 1", "Comment 2", …
+/// the way a native office app's review pane would, even for an unanchored comment.
+struct OfficeComment: Equatable {
+    var id: String
+    var author: String?
+    var dateISO: String?
+    var text: String
+    var number: Int
+}
+
+/// What `OfficeDocumentReader.read` and `DocumentTypes.readOffice` return — the block vocabulary an
+/// office document's BODY becomes, plus every reviewer comment the source declares (P6a; see
+/// `OfficeComment`). Bundled into one result, rather than two independent return values, so the
+/// single dispatch `DocumentTypes.readOffice` (invariant 29) and both readers' `read` stay ONE
+/// call, not two that could silently drift out of sync (a comments-only second call would be
+/// exactly the kind of second, divergent path invariant 29 exists to prevent). `comments` defaults
+/// to `[]` so every pre-P6a construction site (tests building a bare `[OfficeBlock]` result) keeps
+/// compiling and means exactly what it always meant: no comments captured.
+struct OfficeReadResult: Equatable {
+    var blocks: [OfficeBlock]
+    var comments: [OfficeComment] = []
 }

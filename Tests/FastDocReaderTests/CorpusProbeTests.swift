@@ -160,7 +160,7 @@ final class CorpusProbeTests: XCTestCase {
         let blocks: [OfficeBlock]
         do {
             // Single dispatch table, matching invariant 29 — never DocxReader/OdtReader directly.
-            blocks = try DocumentTypes.readOffice(archive, extension: ext)
+            blocks = try DocumentTypes.readOffice(archive, extension: ext).blocks
         } catch {
             s.readerThrew += 1
             return
