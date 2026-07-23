@@ -18,6 +18,9 @@ measured, and deliberately not shipped (invariant 31). Plain text (.txt/.csv/.lo
 images, so supporting it honestly meant writing a second parser the size of the Word one.
 Writing is deliberate and narrow: right-click a block → Edit / Add Below / Move / Delete, held in
 memory until ⌘S.
+A headless `--extract` flag (`FastDocReader --extract <file>`) runs the SAME office reader without any
+GUI and prints the document as Markdown to stdout — for feeding a `.docx`/`.odt` to an AI without it
+spending tokens on the zip/XML (invariant 40).
 Pure Swift/AppKit + TextKit, SwiftPM executable. No web runtime for text. WebKit renders only two
 things — mermaid diagrams and TeX/KaTeX formulas — and only on a cache miss; both cache to vector PDF.
 Code highlighting is native (34 languages, single-pass scanner), no JS.
@@ -45,6 +48,7 @@ Code highlighting is native (34 languages, single-pass scanner), no JS.
 - `App/CommentPanel.swift` — the review-comments sidebar (a RIGHT `NSSplitViewItem` inspector, hidden by default, ⌥⌘C), mirroring `OutlinePanel`; lists `MarkdownDocument.officeComments`. The body highlight + number badge for each comment are drawn behind the glyphs (draw-time, gated by `ReaderTextView.commentsVisible`), never an inline attachment (invariant 38).
 - `Render/RenderTheme.swift` — the BASE design system: type scale + rhythm tokens (line-height / spacing / indent ratios) + colour, inherited by three thin per-format branches `MarkdownStyle` / `OfficeStyle` / `PlainTextStyle`. The rhythm constants live here ONCE; renderers read tokens, never re-inline them (invariant 36). `Render/Office/OfficeTextBuilder.swift` — the ONE format-neutral builder turning the office block vocabulary into typography, applying each block's resolved `ParagraphFormat`/`Span`/table geometry (invariant 37).
 - `Render/TableBlockBuilder.swift` — turns a row/cell vocabulary (markdown GFM + office `Cell`s) into ONE custom-drawn table attachment, shared by both renderers. `Render/TableAttachmentCell.swift` — the table engine: `TableGeometry` (shared cumulative column x-edges + row heights + border-edge grid, view-free and unit-tested) and `TableAttachmentCell` (draws the whole grid itself; `NSTextTable` is NOT used — invariant 39). `Render/SizedAttachmentCell.swift` — the attachment cell that OWNS its `reservedSize` so an `image==nil` medium keeps its space (invariant 1), used by images, formulas and inside table cells.
+- `Render/Office/OfficeMarkdownSerializer.swift` — the `--extract` serializer: office block vocabulary → Markdown (pure `[OfficeBlock] -> String`, view-free), conservative mapping with a `<raw>` fallback for un-mappable tables (invariant 40). `App/HeadlessExtract.swift` — the `--extract` CLI itself (reads the file via the single `DocumentTypes.readOffice` dispatch → serializer → stdout); `App/main.swift` gates it BEFORE `NSApplication` so no GUI starts.
 - `App/TextEncodingDetector.swift` — what a file's bytes actually are (BOM → strict UTF-8 → BOM-less UTF-16 → regional legacy → verified guess → Latin-1), and the bytes to write back in that same encoding.
 - `Render/CodeHighlighter.swift` — single-pass native highlighter, 34 languages + aliases.
 - `Cache/MermaidCache.swift` — content-addressed disk cache, keyed by (source + engine version) so the two engines never collide.
