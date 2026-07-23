@@ -344,6 +344,23 @@ final class OfficeDocumentTests: XCTestCase {
         XCTAssertThrowsError(try DocumentTypes.readOffice(try ZipArchive(data: fixtureDocx()), extension: "rtf"))
     }
 
+    /// The headless `--extract` seam end to end at the library level: bytes → the SAME dispatch the
+    /// app uses (`DocumentTypes.readOffice`) → `OfficeMarkdownSerializer`. A pure serializer unit test
+    /// (`OfficeMarkdownSerializerTests`) can't prove the reader actually FEEDS the serializer — this
+    /// does, through the real dispatch, for both docx and odt (invariant 29's lesson).
+    func testHeadlessExtractSerializesThroughTheRealOfficeDispatch() throws {
+        let cases: [(data: Data, ext: String, heading: String, body: String)] = [
+            (fixtureDocx(), "docx", "# Title", "Body text."),
+            (fixtureOdt(), "odt", "# ODT Title", "ODT body text."),
+        ]
+        for c in cases {
+            let blocks = try DocumentTypes.readOffice(try ZipArchive(data: c.data), extension: c.ext).blocks
+            let markdown = OfficeMarkdownSerializer.serialize(blocks)
+            XCTAssertTrue(markdown.contains(c.heading), "\(c.ext): heading must extract as `\(c.heading)` — got:\n\(markdown)")
+            XCTAssertTrue(markdown.contains(c.body), "\(c.ext): body paragraph must survive")
+        }
+    }
+
     // MARK: Re-render, not a cached string
 
     func testRenderedResultChangesWithThemeFontSize() throws {
