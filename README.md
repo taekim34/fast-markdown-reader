@@ -1,8 +1,11 @@
-# Fast Markdown Reader
+# Fast Document Reader
+
+> **.md .docx reader, built for the AI era**
 
 **AI writes it. You're the one reading it.** Plans, specs, summaries, transcripts — it all lands as
 Markdown now, and reading it has quietly become most of the job. Your reader shouldn't be the slow
-part of that.
+part of that. Markdown first; the `.docx` a collaborator sends opens right beside it, read-only, and
+plain text too.
 
 Most Markdown apps are a web browser wearing a costume, which is why they take a beat to open and
 why memory climbs the longer you leave them running. This one is pure Swift/AppKit/TextKit:
@@ -11,13 +14,14 @@ reclaimed** when they close. No timers, no polling, no background web process.
 
 It is the only native Mac Markdown viewer that renders **mermaid diagrams and TeX formulas with both
 engines bundled in the app** — offline, each one cached once as a vector PDF and never re-rendered
-([`MermaidCache.swift`](Sources/FastMDReader/Cache/MermaidCache.swift)). Images and diagrams
+([`MermaidCache.swift`](Sources/FastDocReader/Cache/MermaidCache.swift)). Images and diagrams
 outside the viewport **release their pixels but keep their exact height**, so memory stays flat and
 the scrollbar never jumps
-([`SizedAttachmentCell.swift`](Sources/FastMDReader/Render/SizedAttachmentCell.swift)).
+([`SizedAttachmentCell.swift`](Sources/FastDocReader/Render/SizedAttachmentCell.swift)).
 
-A reader, on purpose — it opens, renders, and gets out of the way. When something in the text is
-wrong, right-click that block: **Edit** rewrites just its Markdown source, and **Add Below**,
+A reader, on purpose — it opens, renders, and gets out of the way. There is no cursor blinking at
+you and no mode to leave. But it is no longer only a viewer: when something in the text is wrong,
+right-click that block (or press a key): **Edit** rewrites just its Markdown source, and **Add Below**,
 **Move** and **Delete** restructure the document a block at a time. Changes are yours until you
 press ⌘S, and only the block you touched is redrawn — **9 ms on a 64,000-character file, 29 ms on
 1.2 MB**, so undo stays instant in documents where other apps stall.
@@ -31,7 +35,16 @@ block per line, with `#` and `*` left as the characters they are. Files written 
 arrive intact: CP949, UTF-16, Latin-1 and friends are detected rather than assumed, and a file is
 **saved back in the encoding it came in**, CRLF and all.
 
-| | Fast Markdown Reader |
+It also opens **Word (`.docx`, `.docm`, `.dotx`, `.dotm`) and OpenDocument (`.odt`) files** — read-only,
+so nothing you didn't type can change, but shown as the author formatted it: headings, tables with
+merged cells, cell-level images and lists, footnotes, tracked changes, internal links and bookmarks,
+equations (drawn through the same bundled formula engine as Markdown math), charts and diagrams, and
+right-to-left text. Colour, font and size follow the document — your reading-size preference
+multiplies on top of what the author set, the same way Word's own zoom does. The titlebar says
+plainly that these formats are read-only, with a one-click hand-off to whatever app you'd rather edit
+them in.
+
+| | Fast Document Reader |
 |---|---|
 | Engine | 100% native AppKit + TextKit — **no web runtime for text** |
 | Idle CPU | **0%** — no timers, no polling, no background web process |
@@ -39,6 +52,7 @@ arrive intact: CP949, UTF-16, Latin-1 and friends are detected rather than assum
 | Long docs | The whole document is laid out up front, so the **scrollbar is honest from the first frame** — a 4,000-paragraph file opens instantly and never resizes under you |
 | Editing long docs | Only the edited block is re-rendered — **9 ms on 64k characters, 29 ms on 1.2 MB** |
 | Plain text | `.txt` · `.csv` · `.log` shown **verbatim**, one block per line — nothing reinterpreted as Markdown |
+| Word / OpenDocument | `.docx`/`.docm`/`.dotx`/`.dotm`/`.odt` — **read-only**, formatting, tables, equations, charts and RTL text shown as authored |
 | Encodings | CP949 · UTF-16 · Latin-1 detected, not assumed — **saved back in the same encoding**, CRLF kept |
 | Diagrams | **mermaid bundled** — renders offline, cached as vector PDF, never re-rendered |
 | Math | **KaTeX bundled** — `$$…$$` and ```` ```math ```` render offline, vector, cached the same way |
@@ -73,7 +87,7 @@ vector PDF and reused forever — zoom as far as you like, it stays sharp.
 
 Reading the TeX from the source, not the parsed text, is what makes it correct: Markdown claims `_`
 and `^` as emphasis, so `$$a_1^2$$` would otherwise come back as *a12* — wrong maths, which is worse
-than none ([`MarkdownRenderer.swift`](Sources/FastMDReader/Render/MarkdownRenderer.swift)).
+than none ([`MarkdownRenderer.swift`](Sources/FastDocReader/Render/MarkdownRenderer.swift)).
 
 ## Code blocks are real cards
 
@@ -88,7 +102,7 @@ type (`yml`, `golang`, `c++`, `c#`, `sh`, `postgres`, `tsx`, `patch`…):
 > toml · ini · sql · html · xml · css · diff
 
 The highlighter is a single left-to-right scanner, not a stack of regexes painting over each other
-([`CodeHighlighter.swift`](Sources/FastMDReader/Render/CodeHighlighter.swift)). That's what keeps a
+([`CodeHighlighter.swift`](Sources/FastDocReader/Render/CodeHighlighter.swift)). That's what keeps a
 URL's `//` inside a string from turning the rest of the line into a comment — the bug you've seen in
 every editor that gets it wrong. Tables, task lists, footnotes and strikethrough come from
 CommonMark + GFM.
@@ -104,18 +118,18 @@ file, which should open the instant you double-click it.
 
 **Apple Silicon (arm64) only.** Requires macOS 13+.
 
-Download the notarized zip, unzip it, drag `FastMDReader.app` to `/Applications`, double-click.
+Download the notarized zip, unzip it, drag `FastDocReader.app` to `/Applications`, double-click.
 No Gatekeeper prompt and no `xattr` step — the app is signed with a Developer ID and stapled.
 
-To open files here by default: **fast-md-reader → Set as Default App…**, which lists the kinds it
+To open files here by default: **Fast Document Reader → Set as Default App…**, which lists the kinds it
 can claim with a checkbox each — Markdown ticked, text formats yours to choose. Per file, the Finder
 route still works: right-click → **Get Info** → **Open with** → **Change All…**.
 
 ## Build from source
 
 ```bash
-./Scripts/make-app.sh        # builds FastMDReader.app (ad-hoc signed, unsandboxed)
-open FastMDReader.app
+./Scripts/make-app.sh        # builds FastDocReader.app (ad-hoc signed, unsandboxed)
+open FastDocReader.app
 ```
 
 Tests: `swift test`.
