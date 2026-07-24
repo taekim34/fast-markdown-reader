@@ -2,11 +2,11 @@ import AppKit
 import UniformTypeIdentifiers
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    // MUST stay false. The app starts empty (no window) and is driven from the menu bar, so a
-    // windowless app is a normal, intended state — not a reason to quit. Returning true here made
-    // the app terminate the instant Open… was chosen from the empty (zero-window) launch state: the
-    // open panel counts as the "last window", and dismissing it tripped last-window-closed → quit.
-    // With false, closing the last document returns to the empty menu-bar state; quitting is ⌘Q only.
+    // MUST stay false. After its last document closes, the app returns to a windowless menu-bar
+    // state — a normal, intended resting state, not a reason to quit. This matters more now that
+    // launch presents the Open panel (invariant 43): returning true here would let DISMISSING that
+    // panel (it counts as the "last window") trip last-window-closed → quit. With false, closing the
+    // last document — or cancelling the launch panel — returns to the menu-bar state; quitting is ⌘Q only.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
     // Opt out of state restoration entirely: no previously-open documents are reopened on launch,
