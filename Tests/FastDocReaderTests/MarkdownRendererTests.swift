@@ -127,7 +127,7 @@ final class MarkdownRendererTests: XCTestCase {
         Visit https://ww-w.ai for the app.
 
         ```go
-        u := "https://ww-w.ai/fast-markdown-reader"
+        u := "https://ww-w.ai/fast-document-reader"
         ```
 
         Inline `https://ww-w.ai/inline` stays code too.
@@ -139,7 +139,7 @@ final class MarkdownRendererTests: XCTestCase {
             if v != nil { linked.append(text.substring(with: r)) }
         }
         XCTAssertTrue(linked.contains("https://ww-w.ai"), "prose URL stopped linking: \(linked)")
-        XCTAssertFalse(linked.contains(where: { $0.contains("fast-markdown-reader") }), "code URL linked: \(linked)")
+        XCTAssertFalse(linked.contains(where: { $0.contains("fast-document-reader") }), "code URL linked: \(linked)")
         XCTAssertFalse(linked.contains(where: { $0.contains("inline") }), "inline-code URL linked: \(linked)")
     }
 

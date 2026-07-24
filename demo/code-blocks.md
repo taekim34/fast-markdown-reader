@@ -217,7 +217,7 @@ export const open = async (r: Reader): Promise<Result<number>> => {
   </head>
   <body>
     <!-- a real comment -->
-    <a href="https://ww-w.ai/fast-markdown-reader">Download</a>
+    <a href="https://ww-w.ai/fast-document-reader">Download</a>
   </body>
 </html>
 ```
@@ -433,7 +433,7 @@ app: build
 ### JSON
 ```json
 {
-  "name": "fast-markdown-reader",
+  "name": "fast-document-reader",
   "home": "https://ww-w.ai",
   "sandboxed": true,
   "languages": 34,
@@ -443,7 +443,7 @@ app: build
 
 ### YAML
 ```yaml
-name: fast-markdown-reader
+name: fast-document-reader
 home: https://ww-w.ai      # comments after values
 sandboxed: true
 languages: 34
@@ -455,7 +455,7 @@ engines:
 ### TOML
 ```toml
 [package]
-name = "fast-markdown-reader"
+name = "fast-document-reader"
 home = "https://ww-w.ai"   # comment
 languages = 34
 
